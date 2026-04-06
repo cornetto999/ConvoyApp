@@ -32,10 +32,9 @@ import {
 } from "@/lib/destination-suggestions";
 import {
   GEOLOCATION_PERMISSION_DENIED,
-  INITIAL_POSITION_OPTIONS,
+  GEOLOCATION_POSITION_UNAVAILABLE,
+  GEOLOCATION_TIMEOUT,
   WATCH_POSITION_OPTIONS,
-  getLastKnownLocation,
-  getGeolocationErrorMessage,
   getGeolocationUnsupportedMessage,
   saveLastKnownLocation,
 } from "@/lib/geolocation";
@@ -77,8 +76,13 @@ type GapAlert = {
   coordinates: RouteCoordinate;
   gapMeters: number;
 };
+type TrackingStartOptions = {
+  manual?: boolean;
+  forceRecenter?: boolean;
+};
 
-const DEFAULT_CENTER: Coordinate = { lat: 7.0731, lng: 125.6128 };
+const FALLBACK_LOCATION: Coordinate = { lat: 7.0731, lng: 125.6128 };
+const DEFAULT_CENTER: Coordinate = FALLBACK_LOCATION;
 const DEFAULT_VIEWPORT: MapViewport = {
   center: [DEFAULT_CENTER.lng, DEFAULT_CENTER.lat],
   zoom: 13,
@@ -87,6 +91,11 @@ const DEFAULT_VIEWPORT: MapViewport = {
 };
 const REROUTE_THRESHOLD_METERS = 50;
 const LIVE_ORIGIN_LABEL = "Your location";
+const GEOLOCATION_RETRY_INTERVAL_MS = 5000;
+const FALLBACK_AFTER_RETRIES = 3;
+const MOBILE_GPS_HINT = "Keep this screen open while your phone gets a GPS lock.";
+const DESKTOP_GPS_HINT =
+  "Desktop browsers often estimate location from Wi-Fi or IP. For the best convoy accuracy, use a phone with GPS enabled.";
 
 function haversineMeters(a: Coordinate, b: Coordinate) {
   const R = 6371e3;
@@ -117,6 +126,32 @@ function formatDistance(meters: number) {
 
 function normalizeSuggestionLabel(value: string) {
   return value.trim().toLowerCase();
+}
+
+function isLocalhost(hostname: string) {
+  return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1";
+}
+
+function isLikelyMobileDevice() {
+  if (typeof navigator === "undefined") return true;
+
+  return (
+    /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent) ||
+    navigator.maxTouchPoints > 1
+  );
+}
+
+function getTrackingLocationErrorMessage(code?: number) {
+  switch (code) {
+    case GEOLOCATION_PERMISSION_DENIED:
+      return "Permission denied. Please allow location access.";
+    case GEOLOCATION_POSITION_UNAVAILABLE:
+      return "Location unavailable. Try moving outdoors or enabling GPS.";
+    case GEOLOCATION_TIMEOUT:
+      return "Location request timed out. Retrying...";
+    default:
+      return "Location unavailable. Try moving outdoors or enabling GPS.";
+  }
 }
 
 function getBearingDegrees(from: Coordinate, to: Coordinate) {
@@ -223,6 +258,12 @@ export default function ConvoyMap() {
   const [destination, setDestination] = useState<{ name: string; lat: number; lng: number } | null>(null);
   const [routeError, setRouteError] = useState<string | null>(null);
   const [locationError, setLocationError] = useState<string | null>(null);
+  const [locationLoading, setLocationLoading] = useState(true);
+  const [locationStatusMessage, setLocationStatusMessage] = useState("📍 Getting your location...");
+  const [locationHint, setLocationHint] = useState<string | null>(null);
+  const [retryCount, setRetryCount] = useState(0);
+  const [usingFallbackLocation, setUsingFallbackLocation] = useState(false);
+  const [requestingLocationAccess, setRequestingLocationAccess] = useState(false);
   const [plannerMinimized, setPlannerMinimized] = useState(false);
   const [viewport, setViewport] = useState<MapViewport>(DEFAULT_VIEWPORT);
   const [mapInstance, setMapInstance] = useState<MapRef | null>(null);
@@ -235,38 +276,30 @@ export default function ConvoyMap() {
     properties: SpeedPointProperties;
   } | null>(null);
   const quickDestinationSuggestions = useMemo(() => getQuickDestinationSuggestions(6), []);
+  const isMobileDevice = useMemo(() => isLikelyMobileDevice(), []);
+  const requiresHttps = useMemo(() => {
+    if (typeof window === "undefined") return false;
+    return window.location.protocol !== "https:" && !isLocalhost(window.location.hostname);
+  }, []);
+  const defaultLocationHint = isMobileDevice ? MOBILE_GPS_HINT : DESKTOP_GPS_HINT;
 
   const watchIdRef = useRef<number | null>(null);
+  const retryTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const locationIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const prevLocationRef = useRef<Coordinate | null>(null);
   const hasCenteredOnUserRef = useRef(false);
   const skipOriginSearchRef = useRef(false);
   const skipDestinationSearchRef = useRef(false);
+  const retryCountRef = useRef(0);
+  const usingFallbackLocationRef = useRef(false);
+  const forceRecenterOnNextFixRef = useRef(false);
+  const startLocationTrackingRef = useRef<(options?: TrackingStartOptions) => void>(() => {});
   const latestPositionRef = useRef<{
     lat: number;
     lng: number;
     speed: number;
     heading: number;
   } | null>(null);
-
-  const applyRecoveredLocation = useCallback((next: {
-    lat: number;
-    lng: number;
-    speed: number;
-    heading: number;
-  }) => {
-    setMyLocation({ lat: next.lat, lng: next.lng });
-    latestPositionRef.current = next;
-
-    if (!hasCenteredOnUserRef.current) {
-      hasCenteredOnUserRef.current = true;
-      setViewport((current) => ({
-        ...current,
-        center: [next.lng, next.lat],
-        zoom: Math.max(current.zoom, 13),
-      }));
-    }
-  }, []);
 
   const selectedRoute = routeOptions[selectedRouteIndex] ?? null;
   const routeCoords = selectedRoute?.coordinates ?? [];
@@ -281,9 +314,16 @@ export default function ConvoyMap() {
     originMode === "live"
       ? myLocation
         ? "My location"
-        : "Locating..."
+        : usingFallbackLocation
+          ? "Mindanao fallback"
+          : "Locating..."
       : manualOrigin?.name || originInput.trim() || "Custom start";
   const routeDestinationLabel = destination?.name || destInput.trim() || "No destination";
+  const liveOriginWaitingMessage = requiresHttps
+    ? "Geolocation requires HTTPS. Open the app securely or set a custom starting point."
+    : usingFallbackLocation
+      ? "Using Davao City as the Mindanao fallback while we keep looking for your live GPS. You can also set a custom starting point."
+      : "Looking for your live location. Keep the map open or choose a custom starting point.";
 
   const sortedRoutes = useMemo(
     () =>
@@ -393,6 +433,10 @@ export default function ConvoyMap() {
   }, [gapAlert]);
 
   useEffect(() => {
+    setLocationHint(defaultLocationHint);
+  }, [defaultLocationHint]);
+
+  useEffect(() => {
     if (mapViewMode !== "speed") {
       setSelectedSpeedPoint(null);
     }
@@ -461,13 +505,14 @@ export default function ConvoyMap() {
 
     return () => {
       supabase.removeChannel(channel);
-      if (watchIdRef.current !== null) navigator.geolocation.clearWatch(watchIdRef.current);
+      clearLocationRetryTimer();
+      clearLocationWatch();
       if (locationIntervalRef.current) clearInterval(locationIntervalRef.current);
       window.removeEventListener("focus", retryTracking);
       window.removeEventListener("online", retryTracking);
       document.removeEventListener("visibilitychange", retryTracking);
     };
-  }, [applyRecoveredLocation, id, user]);
+  }, [id, user]);
 
   const handleMapRef = useCallback((instance: MapRef | null) => {
     setMapInstance((current) => (current === instance ? current : instance));
@@ -538,38 +583,20 @@ export default function ConvoyMap() {
     if (!data) return;
 
     setLocations(data);
-
-    const myStoredLocation = data.find((location) => location.user_id === user?.id);
-    if (!myStoredLocation || latestPositionRef.current) return;
-
-    const storedUpdatedAt = new Date(myStoredLocation.updated_at).getTime();
-
-    applyRecoveredLocation({
-      lat: myStoredLocation.lat,
-      lng: myStoredLocation.lng,
-      speed: myStoredLocation.speed ?? 0,
-      heading: myStoredLocation.heading ?? 0,
-    });
-    saveLastKnownLocation({
-      lat: myStoredLocation.lat,
-      lng: myStoredLocation.lng,
-      speed: myStoredLocation.speed ?? 0,
-      heading: myStoredLocation.heading ?? 0,
-      updatedAt: Number.isNaN(storedUpdatedAt) ? Date.now() : storedUpdatedAt,
-    });
   };
 
-  const pushLocationUpdate = async (next: {
+  const pushLocationUpdate = useCallback(async (next: {
     lat: number;
     lng: number;
     speed: number;
     heading: number;
   }) => {
-    latestPositionRef.current = next;
+    if (!id || !user) return;
+
     await supabase.from("member_locations").upsert(
       {
-        convoy_id: id!,
-        user_id: user!.id,
+        convoy_id: id,
+        user_id: user.id,
         lat: next.lat,
         lng: next.lng,
         heading: next.heading,
@@ -577,9 +604,9 @@ export default function ConvoyMap() {
       },
       { onConflict: "convoy_id,user_id" },
     );
-  };
+  }, [id, user]);
 
-  const syncCurrentPosition = async (coords: GeolocationCoordinates) => {
+  const syncCurrentPosition = useCallback((coords: GeolocationCoordinates) => {
     const next = {
       lat: coords.latitude,
       lng: coords.longitude,
@@ -590,8 +617,30 @@ export default function ConvoyMap() {
           : 0,
     };
 
+    const shouldRecenter =
+      forceRecenterOnNextFixRef.current ||
+      !hasCenteredOnUserRef.current ||
+      usingFallbackLocationRef.current;
+
+    console.log("Geolocation success:", {
+      lat: next.lat,
+      lng: next.lng,
+      accuracy: coords.accuracy,
+      speed: next.speed,
+      heading: next.heading,
+    });
+
+    latestPositionRef.current = next;
     setMyLocation({ lat: next.lat, lng: next.lng });
+    setLocationLoading(false);
     setLocationError(null);
+    setLocationStatusMessage("✅ Location acquired");
+    setLocationHint(isMobileDevice ? null : DESKTOP_GPS_HINT);
+    setRetryCount(0);
+    retryCountRef.current = 0;
+    setRequestingLocationAccess(false);
+    usingFallbackLocationRef.current = false;
+    setUsingFallbackLocation(false);
     saveLastKnownLocation({
       lat: next.lat,
       lng: next.lng,
@@ -599,7 +648,8 @@ export default function ConvoyMap() {
       speed: next.speed,
       updatedAt: Date.now(),
     });
-    if (!hasCenteredOnUserRef.current) {
+
+    if (shouldRecenter) {
       hasCenteredOnUserRef.current = true;
       setViewport((current) => ({
         ...current,
@@ -607,8 +657,11 @@ export default function ConvoyMap() {
         zoom: Math.max(current.zoom, 14),
       }));
     }
-    await pushLocationUpdate(next);
-  };
+    forceRecenterOnNextFixRef.current = false;
+    void pushLocationUpdate(next).catch((error) => {
+      console.warn("Failed to sync member location:", error);
+    });
+  }, [isMobileDevice, pushLocationUpdate]);
 
   const resolveSuggestionCoordinates = async (suggestion: DestinationSuggestion) => {
     if (typeof suggestion.lat === "number" && typeof suggestion.lon === "number") {
@@ -646,74 +699,185 @@ export default function ConvoyMap() {
     [destination, manualOrigin, mapInstance, myLocation, routeOrigin],
   );
 
-  const handleLocationError = (
-    error: GeolocationPositionError,
-    { retrying = false }: { retrying?: boolean } = {},
-  ) => {
-    console.error("Geolocation error:", error);
-    if (latestPositionRef.current && error.code !== GEOLOCATION_PERMISSION_DENIED) {
-      setLocationError("Using your recent location while live GPS reconnects.");
+  const clearLocationRetryTimer = useCallback(() => {
+    if (retryTimeoutRef.current) {
+      clearTimeout(retryTimeoutRef.current);
+      retryTimeoutRef.current = null;
+    }
+  }, []);
+
+  const clearLocationWatch = useCallback(() => {
+    if (
+      typeof navigator !== "undefined" &&
+      "geolocation" in navigator &&
+      watchIdRef.current !== null
+    ) {
+      navigator.geolocation.clearWatch(watchIdRef.current);
+      watchIdRef.current = null;
+    }
+  }, []);
+
+  const applyFallbackLocation = useCallback((hint?: string) => {
+    const shouldMoveToFallback = !usingFallbackLocationRef.current && !latestPositionRef.current;
+
+    usingFallbackLocationRef.current = true;
+    setUsingFallbackLocation(true);
+    setLocationLoading(false);
+    setLocationStatusMessage("⚠️ Using fallback location");
+    setLocationHint(
+      hint ?? "Showing Davao City for now while we keep trying to get your live location.",
+    );
+
+    if (shouldMoveToFallback) {
+      setViewport((current) => ({
+        ...current,
+        center: [FALLBACK_LOCATION.lng, FALLBACK_LOCATION.lat],
+        zoom: Math.max(current.zoom, 12),
+      }));
+    }
+  }, []);
+
+  const scheduleLocationRetry = useCallback((options: TrackingStartOptions = {}) => {
+    clearLocationRetryTimer();
+    retryTimeoutRef.current = setTimeout(() => {
+      startLocationTrackingRef.current(options);
+    }, GEOLOCATION_RETRY_INTERVAL_MS);
+  }, [clearLocationRetryTimer]);
+
+  const startLocationTracking = useCallback((options: TrackingStartOptions = {}) => {
+    forceRecenterOnNextFixRef.current = Boolean(options.forceRecenter);
+
+    if (options.manual) {
+      setPlannerMinimized(false);
+      setRequestingLocationAccess(true);
+      setLocationError(null);
+    }
+
+    if (requiresHttps) {
+      const message = "Geolocation requires HTTPS";
+      console.warn("Geolocation error:", { code: "https", message });
+      clearLocationRetryTimer();
+      clearLocationWatch();
+      setLocationLoading(false);
+      setLocationError(message);
+      setRequestingLocationAccess(false);
+      applyFallbackLocation("Open this app over HTTPS to use live convoy tracking.");
       return;
     }
 
-    setLocationError(getGeolocationErrorMessage(error, "tracking", retrying));
-  };
+    if (typeof navigator === "undefined" || !("geolocation" in navigator)) {
+      const message = getGeolocationUnsupportedMessage("tracking");
+      console.warn("Geolocation error:", { code: "unsupported", message });
+      clearLocationRetryTimer();
+      clearLocationWatch();
+      setLocationLoading(false);
+      setLocationError(message);
+      setRequestingLocationAccess(false);
+      applyFallbackLocation(defaultLocationHint);
+      return;
+    }
 
-  const beginWatch = () => {
-    if (watchIdRef.current !== null) return;
+    clearLocationRetryTimer();
+    clearLocationWatch();
+    setLocationLoading(true);
+    setLocationStatusMessage(
+      retryCountRef.current > 0 ? "📡 Weak signal, retrying..." : "📍 Getting your location...",
+    );
 
     watchIdRef.current = navigator.geolocation.watchPosition(
       (position) => {
-        void syncCurrentPosition(position.coords);
+        clearLocationRetryTimer();
+        syncCurrentPosition(position.coords);
       },
       (error) => {
-        const permissionDenied = error.code === GEOLOCATION_PERMISSION_DENIED;
-        handleLocationError(error, { retrying: !permissionDenied });
-        if (permissionDenied && watchIdRef.current !== null) {
-          navigator.geolocation.clearWatch(watchIdRef.current);
-          watchIdRef.current = null;
+        console.warn("Geolocation error:", {
+          code: error.code,
+          message: error.message,
+        });
+
+        setRequestingLocationAccess(false);
+
+        if (error.code === GEOLOCATION_PERMISSION_DENIED) {
+          clearLocationRetryTimer();
+          clearLocationWatch();
+          setLocationLoading(false);
+          setLocationError(getTrackingLocationErrorMessage(error.code));
+          setLocationHint(
+            "Open your browser or device settings, allow location access, then tap Retry Location.",
+          );
+
+          if (!latestPositionRef.current) {
+            applyFallbackLocation(
+              "Location access is required for live convoy tracking. You can still browse the map with the fallback center.",
+            );
+          }
+
+          return;
         }
+
+        const nextRetryCount = retryCountRef.current + 1;
+        retryCountRef.current = nextRetryCount;
+        setRetryCount(nextRetryCount);
+        setLocationError(getTrackingLocationErrorMessage(error.code));
+        setLocationStatusMessage("📡 Weak signal, retrying...");
+        setLocationHint(defaultLocationHint);
+        setLocationLoading(true);
+        clearLocationWatch();
+
+        if (nextRetryCount >= FALLBACK_AFTER_RETRIES && !latestPositionRef.current) {
+          applyFallbackLocation("Still trying to get your actual location in the background.");
+        }
+
+        scheduleLocationRetry(options);
       },
       WATCH_POSITION_OPTIONS,
-    );
-  };
-
-  const startLocationTracking = () => {
-    if (!("geolocation" in navigator)) {
-      setLocationError(getGeolocationUnsupportedMessage("tracking"));
-      return;
-    }
-
-    const cachedLocation = getLastKnownLocation();
-    if (cachedLocation && !latestPositionRef.current) {
-      applyRecoveredLocation(cachedLocation);
-      setLocationError("Using your recent location while live GPS reconnects.");
-    }
-
-    beginWatch();
-
-    navigator.geolocation.getCurrentPosition(
-      (position) => {
-        void syncCurrentPosition(position.coords);
-        beginWatch();
-      },
-      (error) => {
-        const permissionDenied = error.code === GEOLOCATION_PERMISSION_DENIED;
-        handleLocationError(error, { retrying: !permissionDenied });
-        if (!permissionDenied) {
-          beginWatch();
-        }
-      },
-      INITIAL_POSITION_OPTIONS,
     );
 
     if (locationIntervalRef.current) {
       clearInterval(locationIntervalRef.current);
     }
+
     locationIntervalRef.current = setInterval(() => {
       if (!latestPositionRef.current) return;
-      void pushLocationUpdate(latestPositionRef.current);
+      void pushLocationUpdate(latestPositionRef.current).catch((error) => {
+        console.warn("Failed to keep location alive:", error);
+      });
     }, 5000);
+  }, [
+    applyFallbackLocation,
+    clearLocationRetryTimer,
+    clearLocationWatch,
+    defaultLocationHint,
+    pushLocationUpdate,
+    requiresHttps,
+    scheduleLocationRetry,
+    syncCurrentPosition,
+  ]);
+
+  startLocationTrackingRef.current = startLocationTracking;
+
+  const handleRetryLocationAccess = () => {
+    retryCountRef.current = 0;
+    setRetryCount(0);
+    setRouteError(null);
+    setLocationStatusMessage("📍 Getting your location...");
+    startLocationTracking({ manual: true });
+  };
+
+  const handleUseMyLocationAgain = () => {
+    setCameraLocked(false);
+    setRouteError(null);
+
+    if (myLocation) {
+      hasCenteredOnUserRef.current = true;
+      setViewport((current) => ({
+        ...current,
+        center: [myLocation.lng, myLocation.lat],
+        zoom: Math.max(current.zoom, 15),
+      }));
+    }
+
+    startLocationTracking({ manual: true, forceRecenter: true });
   };
 
   const getMemberColor = (role: string) => {
@@ -780,7 +944,7 @@ export default function ConvoyMap() {
       setRouteOptions([]);
       setSelectedRouteIndex(0);
       setIsLoadingRoutes(false);
-      setRouteError("Waiting for your live location to start routing.");
+      setRouteError(liveOriginWaitingMessage);
       return;
     }
 
@@ -807,7 +971,7 @@ export default function ConvoyMap() {
       setRouteOrigin(myLocation);
       setRouteError(null);
     }
-  }, [destination, manualOrigin, myLocation, originMode]);
+  }, [destination, liveOriginWaitingMessage, manualOrigin, myLocation, originMode]);
 
   useEffect(() => {
     if (!destination || !routeOrigin) {
@@ -1105,7 +1269,8 @@ export default function ConvoyMap() {
     resetRouteSelection();
     setIsLoadingRoutes(Boolean(destination && myLocation));
     if (!myLocation) {
-      setRouteError("Waiting for your live location to start routing.");
+      setRouteError(liveOriginWaitingMessage);
+      handleUseMyLocationAgain();
     }
   };
 
@@ -1113,6 +1278,13 @@ export default function ConvoyMap() {
     const trimmedDestination = destInput.trim();
     if (!trimmedDestination) return;
     let activeOrigin = originMode === "manual" ? manualOrigin : myLocation;
+
+    if (originMode === "live" && !activeOrigin) {
+      setRouteError(liveOriginWaitingMessage);
+      toast.error("We’re still getting your live location. Choose a custom starting point or retry location.");
+      handleRetryLocationAccess();
+      return;
+    }
 
     if (originMode === "manual") {
       const trimmedOrigin = originInput.trim();
@@ -1246,9 +1418,13 @@ export default function ConvoyMap() {
                 <p className="max-w-[220px] truncate text-xs text-muted-foreground">
                   → {destination.name}
                 </p>
-              ) : locationError ? (
-                <p className="max-w-[220px] truncate text-[11px] text-destructive">
-                  {locationError}
+              ) : locationError || locationLoading || usingFallbackLocation ? (
+                <p
+                  className={`max-w-[220px] truncate text-[11px] ${
+                    locationError ? "text-destructive" : "text-muted-foreground"
+                  }`}
+                >
+                  {locationStatusMessage}
                 </p>
               ) : (
                 <p className="text-xs text-muted-foreground">Live convoy view</p>
@@ -1479,7 +1655,6 @@ export default function ConvoyMap() {
             position="bottom-left"
             showZoom
             showCompass
-            showLocate
             showFullscreen
             onLocate={({ longitude, latitude }) => {
               setViewport((current) => ({
@@ -1494,6 +1669,42 @@ export default function ConvoyMap() {
         <ViewportHud viewport={viewport} />
 
         <div className="absolute left-3 top-20 z-20 flex flex-col gap-2">
+          <div className="w-[min(360px,calc(100vw-1.5rem))] rounded-2xl border bg-card/95 p-3 shadow-lg backdrop-blur-md">
+            <div className="flex items-start justify-between gap-3">
+              <div className="min-w-0">
+                <p className="text-sm font-semibold">{locationStatusMessage}</p>
+                {locationError && (
+                  <p className="mt-1 text-xs text-destructive">{locationError}</p>
+                )}
+                {locationHint && (
+                  <p className="mt-1 text-xs text-muted-foreground">{locationHint}</p>
+                )}
+                <div className="mt-2 flex flex-wrap gap-2 text-[11px] text-muted-foreground">
+                  <span className="rounded-full border px-2 py-1">
+                    Retries: {retryCount}
+                  </span>
+                  <span className="rounded-full border px-2 py-1">
+                    {myLocation ? "Live GPS" : usingFallbackLocation ? "Fallback center" : "Searching"}
+                  </span>
+                </div>
+              </div>
+              {locationLoading && <Loader2 className="mt-0.5 h-4 w-4 animate-spin text-muted-foreground" />}
+            </div>
+
+            <div className="mt-3 flex flex-wrap gap-2">
+              <Button
+                size="sm"
+                variant="secondary"
+                onClick={handleRetryLocationAccess}
+                disabled={requestingLocationAccess}
+                className="gap-2"
+              >
+                <LocateFixed className="h-4 w-4" />
+                {requestingLocationAccess ? "Retrying..." : "Retry Location"}
+              </Button>
+            </div>
+          </div>
+
           <div className="flex flex-col gap-2 sm:flex-row">
             <Button size="sm" variant="secondary" onClick={handle3DView}>
               <Mountain className="mr-1.5 h-4 w-4" />
@@ -1653,8 +1864,8 @@ export default function ConvoyMap() {
                 <span>
                   {originMode === "live"
                     ? myLocation
-                      ? "Your route origin updates with your actual location."
-                      : "Waiting for your actual location."
+                      ? "Your route origin updates smoothly from your live GPS."
+                      : liveOriginWaitingMessage
                     : manualOrigin?.name || "Search for where you're starting from."}
                 </span>
               </div>

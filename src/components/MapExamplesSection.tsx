@@ -4,6 +4,7 @@ import {
   Compass,
   Hand,
   Loader2,
+  MapPin,
   Mountain,
   Navigation,
   RotateCcw,
@@ -35,6 +36,44 @@ type RouteData = {
   duration: number;
   distance: number;
 };
+
+const extensionIdeas = [
+  {
+    title: "Real-time tracking",
+    description: "Live location updates for rides, convoy followers, or fleet management.",
+    icon: Navigation,
+  },
+  {
+    title: "Geofencing",
+    description: "Trigger actions when users enter or leave specific areas.",
+    icon: MapPin,
+  },
+  {
+    title: "Heatmaps",
+    description: "Visualize density data like population, crime, or activity hotspots.",
+    icon: Compass,
+  },
+  {
+    title: "Drawing tools",
+    description: "Let users draw polygons, lines, or place markers for custom areas.",
+    icon: Hand,
+  },
+  {
+    title: "3D buildings",
+    description: "Extrude building footprints for urban visualization and city planning views.",
+    icon: Mountain,
+  },
+  {
+    title: "Animations",
+    description: "Animate markers along routes or create fly-through experiences.",
+    icon: Route,
+  },
+  {
+    title: "Custom data layers",
+    description: "Overlay weather, traffic, or satellite imagery on top of the map.",
+    icon: Settings2,
+  },
+] as const;
 
 function formatDuration(seconds: number) {
   const mins = Math.round(seconds / 60);
@@ -433,6 +472,40 @@ export default function MapExamplesSection({
         >
           <AdvancedUsageExample />
         </ExampleCard>
+      </div>
+
+      <div className="mt-6 rounded-3xl border border-border/70 bg-card/70 p-6 shadow-sm backdrop-blur-sm">
+        <div className="max-w-2xl space-y-3">
+          <p className="inline-flex rounded-full border border-primary/20 bg-primary/10 px-3 py-1 text-xs font-medium text-primary">
+            Extend to Build
+          </p>
+          <h3 className="text-2xl font-bold tracking-tight">
+            Build custom map features on top of the same Convoy map foundation
+          </h3>
+          <p className="text-muted-foreground">
+            You can extend this shared map system into richer product features for live operations,
+            analytics, and urban-style visualization.
+          </p>
+        </div>
+
+        <div className="mt-6 grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+          {extensionIdeas.map(({ title, description, icon: Icon }) => (
+            <div
+              key={title}
+              className="rounded-2xl border border-border/70 bg-background/80 p-4 shadow-sm"
+            >
+              <div className="flex items-start gap-3">
+                <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl bg-primary/10 text-primary">
+                  <Icon className="h-5 w-5" />
+                </div>
+                <div className="space-y-1">
+                  <p className="font-semibold">{title}</p>
+                  <p className="text-sm text-muted-foreground">{description}</p>
+                </div>
+              </div>
+            </div>
+          ))}
+        </div>
       </div>
     </section>
   );

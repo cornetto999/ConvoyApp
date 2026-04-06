@@ -4,14 +4,14 @@ export const GEOLOCATION_TIMEOUT = 3;
 export const LAST_KNOWN_LOCATION_KEY = "convoy.last_known_location";
 
 export const INITIAL_POSITION_OPTIONS: PositionOptions = {
-  enableHighAccuracy: false,
-  maximumAge: 60_000,
+  enableHighAccuracy: true,
+  maximumAge: 0,
   timeout: 20_000,
 };
 
 export const WATCH_POSITION_OPTIONS: PositionOptions = {
-  enableHighAccuracy: false,
-  maximumAge: 30_000,
+  enableHighAccuracy: true,
+  maximumAge: 0,
   timeout: 20_000,
 };
 
@@ -37,25 +37,13 @@ export function getGeolocationErrorMessage(
 ) {
   switch (error?.code) {
     case GEOLOCATION_PERMISSION_DENIED:
-      return context === "auth"
-        ? "Location access is off. Turn it on so convoy members can see your live position."
-        : "Location access is off. Turn it on in your browser or device settings.";
+      return "Permission denied. Please allow location access.";
     case GEOLOCATION_POSITION_UNAVAILABLE:
-      if (retrying && context === "tracking") {
-        return "Location is temporarily unavailable. Retrying while your device gets a GPS fix.";
-      }
-
-      return context === "locate"
-        ? "Your current location is not available yet. Try again in a moment."
-        : "Location is temporarily unavailable. Check GPS, signal, or device location services and try again.";
+      return retrying && context === "tracking"
+        ? "Location unavailable. Try moving outdoors or enabling GPS."
+        : "Location unavailable. Try moving outdoors or enabling GPS.";
     case GEOLOCATION_TIMEOUT:
-      if (retrying && context === "tracking") {
-        return "Location request timed out. Retrying automatically.";
-      }
-
-      return context === "auth"
-        ? "The location request took too long. You can continue now and enable location again later."
-        : "Location request timed out. Try again in a moment.";
+      return "Location request timed out. Retrying...";
     default:
       return context === "auth"
         ? "Turn on location to use live convoy tracking and member speed updates."

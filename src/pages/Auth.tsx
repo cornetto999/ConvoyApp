@@ -18,6 +18,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Separator } from "@/components/ui/separator";
 import MapExamplesSection from "@/components/MapExamplesSection";
 import {
+  GEOLOCATION_PERMISSION_DENIED,
   INITIAL_POSITION_OPTIONS,
   getGeolocationErrorMessage,
   getGeolocationUnsupportedMessage,
@@ -39,11 +40,17 @@ export default function Auth() {
   const [submitting, setSubmitting] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
   const [locationPromptOpen, setLocationPromptOpen] = useState(false);
+  const [locationPromptMessage, setLocationPromptMessage] = useState<string | null>(null);
   const [verificationEmail, setVerificationEmail] = useState<string | null>(null);
   const [requestingLocation, setRequestingLocation] = useState(false);
   const { signIn, signUp, user } = useAuth();
   const navigate = useNavigate();
   const location = useLocation();
+
+  const markLocationPromptSeen = () => {
+    if (typeof window === "undefined") return;
+    window.localStorage.setItem(LOCATION_PROMPT_SEEN_KEY, "1");
+  };
 
   const finishAuth = async () => {
     if (typeof window === "undefined") {
@@ -76,23 +83,30 @@ export default function Auth() {
       // Fall back to showing the prompt once when permission state can't be inspected.
     }
 
-    window.localStorage.setItem(LOCATION_PROMPT_SEEN_KEY, "1");
+    setLocationPromptMessage(null);
     setLocationPromptOpen(true);
   };
 
   const navigateToApp = () => {
+    setLocationPromptMessage(null);
     setLocationPromptOpen(false);
     navigate("/");
   };
 
+  const handleSkipLocationPrompt = () => {
+    markLocationPromptSeen();
+    navigateToApp();
+  };
+
   const handleEnableLocation = async () => {
     if (!("geolocation" in navigator)) {
+      markLocationPromptSeen();
       toast.error(getGeolocationUnsupportedMessage("auth"));
       navigateToApp();
       return;
     }
 
-    window.localStorage.setItem(LOCATION_PROMPT_SEEN_KEY, "1");
+    setLocationPromptMessage(null);
     setRequestingLocation(true);
 
     try {
@@ -110,11 +124,24 @@ export default function Auth() {
             : 0,
         updatedAt: Date.now(),
       });
+      markLocationPromptSeen();
+      toast.success("Location enabled.");
+      navigateToApp();
     } catch (error) {
-      toast.error(getGeolocationErrorMessage(error, "auth"));
+      const locationRequestError = error as { code?: number; message?: string | null };
+      const message = getGeolocationErrorMessage(locationRequestError, "auth");
+      setLocationPromptMessage(message);
+
+      if (locationRequestError.code === GEOLOCATION_PERMISSION_DENIED) {
+        markLocationPromptSeen();
+        toast.error(message);
+        navigateToApp();
+        return;
+      }
+
+      toast.error(message);
     } finally {
       setRequestingLocation(false);
-      navigateToApp();
     }
   };
 
@@ -371,9 +398,12 @@ export default function Auth() {
             <AlertDialogDescription>
               Location helps Convoy show your live position, speed, and regroup alerts once you join a trip.
             </AlertDialogDescription>
+            {locationPromptMessage && (
+              <p className="text-sm text-amber-600">{locationPromptMessage}</p>
+            )}
           </AlertDialogHeader>
           <AlertDialogFooter>
-            <AlertDialogCancel onClick={navigateToApp} disabled={requestingLocation}>
+            <AlertDialogCancel onClick={handleSkipLocationPrompt} disabled={requestingLocation}>
               Maybe later
             </AlertDialogCancel>
             <AlertDialogAction onClick={() => void handleEnableLocation()} disabled={requestingLocation}>
