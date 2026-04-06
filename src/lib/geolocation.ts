@@ -1,6 +1,27 @@
 export const GEOLOCATION_PERMISSION_DENIED = 1;
 export const GEOLOCATION_POSITION_UNAVAILABLE = 2;
 export const GEOLOCATION_TIMEOUT = 3;
+export const LAST_KNOWN_LOCATION_KEY = "convoy.last_known_location";
+
+export const INITIAL_POSITION_OPTIONS: PositionOptions = {
+  enableHighAccuracy: false,
+  maximumAge: 60_000,
+  timeout: 20_000,
+};
+
+export const WATCH_POSITION_OPTIONS: PositionOptions = {
+  enableHighAccuracy: false,
+  maximumAge: 30_000,
+  timeout: 20_000,
+};
+
+export type PersistedLocation = {
+  lat: number;
+  lng: number;
+  heading: number;
+  speed: number;
+  updatedAt: number;
+};
 
 export type GeolocationErrorLike = {
   code?: number;
@@ -57,4 +78,38 @@ export function requestCurrentPosition(options?: PositionOptions) {
 
     navigator.geolocation.getCurrentPosition(resolve, reject, options);
   });
+}
+
+export function saveLastKnownLocation(location: PersistedLocation) {
+  if (typeof window === "undefined") return;
+
+  window.localStorage.setItem(LAST_KNOWN_LOCATION_KEY, JSON.stringify(location));
+}
+
+export function getLastKnownLocation(maxAgeMs = 30 * 60 * 1000): PersistedLocation | null {
+  if (typeof window === "undefined") return null;
+
+  const raw = window.localStorage.getItem(LAST_KNOWN_LOCATION_KEY);
+  if (!raw) return null;
+
+  try {
+    const parsed = JSON.parse(raw) as Partial<PersistedLocation>;
+    if (
+      typeof parsed.lat !== "number" ||
+      typeof parsed.lng !== "number" ||
+      typeof parsed.heading !== "number" ||
+      typeof parsed.speed !== "number" ||
+      typeof parsed.updatedAt !== "number"
+    ) {
+      return null;
+    }
+
+    if (Date.now() - parsed.updatedAt > maxAgeMs) {
+      return null;
+    }
+
+    return parsed as PersistedLocation;
+  } catch {
+    return null;
+  }
 }

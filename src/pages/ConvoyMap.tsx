@@ -5,6 +5,8 @@ import { toast } from "sonner";
 import {
   AlertTriangle,
   ArrowLeft,
+  ChevronDown,
+  ChevronUp,
   Clock,
   Loader2,
   LocateFixed,
@@ -30,8 +32,12 @@ import {
 } from "@/lib/destination-suggestions";
 import {
   GEOLOCATION_PERMISSION_DENIED,
+  INITIAL_POSITION_OPTIONS,
+  WATCH_POSITION_OPTIONS,
+  getLastKnownLocation,
   getGeolocationErrorMessage,
   getGeolocationUnsupportedMessage,
+  saveLastKnownLocation,
 } from "@/lib/geolocation";
 import {
   Map as AppMap,
@@ -217,6 +223,7 @@ export default function ConvoyMap() {
   const [destination, setDestination] = useState<{ name: string; lat: number; lng: number } | null>(null);
   const [routeError, setRouteError] = useState<string | null>(null);
   const [locationError, setLocationError] = useState<string | null>(null);
+  const [plannerMinimized, setPlannerMinimized] = useState(false);
   const [viewport, setViewport] = useState<MapViewport>(DEFAULT_VIEWPORT);
   const [mapInstance, setMapInstance] = useState<MapRef | null>(null);
   const [mapReady, setMapReady] = useState(false);
@@ -242,6 +249,25 @@ export default function ConvoyMap() {
     heading: number;
   } | null>(null);
 
+  const applyRecoveredLocation = useCallback((next: {
+    lat: number;
+    lng: number;
+    speed: number;
+    heading: number;
+  }) => {
+    setMyLocation({ lat: next.lat, lng: next.lng });
+    latestPositionRef.current = next;
+
+    if (!hasCenteredOnUserRef.current) {
+      hasCenteredOnUserRef.current = true;
+      setViewport((current) => ({
+        ...current,
+        center: [next.lng, next.lat],
+        zoom: Math.max(current.zoom, 13),
+      }));
+    }
+  }, []);
+
   const selectedRoute = routeOptions[selectedRouteIndex] ?? null;
   const routeCoords = selectedRoute?.coordinates ?? [];
   const routeMode = selectedRoute?.mode ?? null;
@@ -251,6 +277,13 @@ export default function ConvoyMap() {
         durationMin: selectedRoute.duration / 60,
       }
     : null;
+  const routeOriginLabel =
+    originMode === "live"
+      ? myLocation
+        ? "My location"
+        : "Locating..."
+      : manualOrigin?.name || originInput.trim() || "Custom start";
+  const routeDestinationLabel = destination?.name || destInput.trim() || "No destination";
 
   const sortedRoutes = useMemo(
     () =>
@@ -393,6 +426,15 @@ export default function ConvoyMap() {
     void loadLocations();
     startLocationTracking();
 
+    const retryTracking = () => {
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
+      startLocationTracking();
+    };
+
+    window.addEventListener("focus", retryTracking);
+    window.addEventListener("online", retryTracking);
+    document.addEventListener("visibilitychange", retryTracking);
+
     const channel = supabase
       .channel(`convoy-map-${id}`)
       .on(
@@ -421,8 +463,11 @@ export default function ConvoyMap() {
       supabase.removeChannel(channel);
       if (watchIdRef.current !== null) navigator.geolocation.clearWatch(watchIdRef.current);
       if (locationIntervalRef.current) clearInterval(locationIntervalRef.current);
+      window.removeEventListener("focus", retryTracking);
+      window.removeEventListener("online", retryTracking);
+      document.removeEventListener("visibilitychange", retryTracking);
     };
-  }, [id, user]);
+  }, [applyRecoveredLocation, id, user]);
 
   const handleMapRef = useCallback((instance: MapRef | null) => {
     setMapInstance((current) => (current === instance ? current : instance));
@@ -490,7 +535,28 @@ export default function ConvoyMap() {
 
   const loadLocations = async () => {
     const { data } = await supabase.from("member_locations").select("*").eq("convoy_id", id!);
-    if (data) setLocations(data);
+    if (!data) return;
+
+    setLocations(data);
+
+    const myStoredLocation = data.find((location) => location.user_id === user?.id);
+    if (!myStoredLocation || latestPositionRef.current) return;
+
+    const storedUpdatedAt = new Date(myStoredLocation.updated_at).getTime();
+
+    applyRecoveredLocation({
+      lat: myStoredLocation.lat,
+      lng: myStoredLocation.lng,
+      speed: myStoredLocation.speed ?? 0,
+      heading: myStoredLocation.heading ?? 0,
+    });
+    saveLastKnownLocation({
+      lat: myStoredLocation.lat,
+      lng: myStoredLocation.lng,
+      speed: myStoredLocation.speed ?? 0,
+      heading: myStoredLocation.heading ?? 0,
+      updatedAt: Number.isNaN(storedUpdatedAt) ? Date.now() : storedUpdatedAt,
+    });
   };
 
   const pushLocationUpdate = async (next: {
@@ -526,6 +592,13 @@ export default function ConvoyMap() {
 
     setMyLocation({ lat: next.lat, lng: next.lng });
     setLocationError(null);
+    saveLastKnownLocation({
+      lat: next.lat,
+      lng: next.lng,
+      heading: next.heading,
+      speed: next.speed,
+      updatedAt: Date.now(),
+    });
     if (!hasCenteredOnUserRef.current) {
       hasCenteredOnUserRef.current = true;
       setViewport((current) => ({
@@ -578,6 +651,11 @@ export default function ConvoyMap() {
     { retrying = false }: { retrying?: boolean } = {},
   ) => {
     console.error("Geolocation error:", error);
+    if (latestPositionRef.current && error.code !== GEOLOCATION_PERMISSION_DENIED) {
+      setLocationError("Using your recent location while live GPS reconnects.");
+      return;
+    }
+
     setLocationError(getGeolocationErrorMessage(error, "tracking", retrying));
   };
 
@@ -596,7 +674,7 @@ export default function ConvoyMap() {
           watchIdRef.current = null;
         }
       },
-      { enableHighAccuracy: true, maximumAge: 5000, timeout: 10000 },
+      WATCH_POSITION_OPTIONS,
     );
   };
 
@@ -605,6 +683,14 @@ export default function ConvoyMap() {
       setLocationError(getGeolocationUnsupportedMessage("tracking"));
       return;
     }
+
+    const cachedLocation = getLastKnownLocation();
+    if (cachedLocation && !latestPositionRef.current) {
+      applyRecoveredLocation(cachedLocation);
+      setLocationError("Using your recent location while live GPS reconnects.");
+    }
+
+    beginWatch();
 
     navigator.geolocation.getCurrentPosition(
       (position) => {
@@ -618,9 +704,12 @@ export default function ConvoyMap() {
           beginWatch();
         }
       },
-      { enableHighAccuracy: true, maximumAge: 0, timeout: 8000 },
+      INITIAL_POSITION_OPTIONS,
     );
 
+    if (locationIntervalRef.current) {
+      clearInterval(locationIntervalRef.current);
+    }
     locationIntervalRef.current = setInterval(() => {
       if (!latestPositionRef.current) return;
       void pushLocationUpdate(latestPositionRef.current);
@@ -951,6 +1040,7 @@ export default function ConvoyMap() {
   };
 
   const handleOriginInputChange = (value: string) => {
+    setPlannerMinimized(false);
     setOriginMode("manual");
     setOriginInput(value);
     setManualOrigin(null);
@@ -963,6 +1053,7 @@ export default function ConvoyMap() {
   };
 
   const handleOriginInputFocus = () => {
+    setPlannerMinimized(false);
     if (originMode !== "live") return;
     setOriginMode("manual");
     setOriginInput("");
@@ -1003,6 +1094,7 @@ export default function ConvoyMap() {
   };
 
   const handleUseLiveOrigin = () => {
+    setPlannerMinimized(false);
     skipOriginSearchRef.current = true;
     setOriginMode("live");
     setOriginInput(LIVE_ORIGIN_LABEL);
@@ -1068,7 +1160,11 @@ export default function ConvoyMap() {
     }
 
     if (activeOrigin && activeDestination) {
+      if (typeof document !== "undefined" && document.activeElement instanceof HTMLElement) {
+        document.activeElement.blur();
+      }
       focusRouteIn3D(activeOrigin, activeDestination);
+      setPlannerMinimized(true);
     }
   };
 
@@ -1452,174 +1548,217 @@ export default function ConvoyMap() {
         </div>
 
         <div className="absolute top-3 left-1/2 z-30 w-[min(680px,92vw)] -translate-x-1/2">
-          <form
-            className="space-y-2 rounded-xl border bg-card/95 p-3 shadow-lg backdrop-blur-md"
-            onSubmit={(event) => {
-              event.preventDefault();
-              void handleApplyRouteSearch();
-            }}
-          >
-            <div className="grid gap-2 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]">
-              <div className="space-y-1">
+          {plannerMinimized ? (
+            <button
+              type="button"
+              className="flex w-full items-center justify-between gap-3 rounded-xl border bg-card/95 px-4 py-3 text-left shadow-lg backdrop-blur-md transition-colors hover:bg-card"
+              onClick={() => setPlannerMinimized(false)}
+            >
+              <div className="min-w-0">
                 <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
-                  From
+                  Route Planner
                 </p>
-                <Input
-                  placeholder="Your location or search a starting point"
-                  value={originInput}
-                  onFocus={handleOriginInputFocus}
-                  onChange={(event) => handleOriginInputChange(event.target.value)}
-                  className="flex-1"
-                />
+                <p className="truncate text-sm font-semibold">
+                  {routeOriginLabel} to {routeDestinationLabel}
+                </p>
               </div>
-
-              <div className="space-y-1">
+              <div className="flex shrink-0 items-center gap-2">
+                {routeInfo && (
+                  <span className="rounded-full border px-2 py-1 text-[11px] text-muted-foreground">
+                    {Math.round(routeInfo.durationMin)} min
+                  </span>
+                )}
+                <ChevronDown className="h-4 w-4 text-muted-foreground" />
+              </div>
+            </button>
+          ) : (
+            <form
+              className="space-y-2 rounded-xl border bg-card/95 p-3 shadow-lg backdrop-blur-md"
+              onSubmit={(event) => {
+                event.preventDefault();
+                void handleApplyRouteSearch();
+              }}
+            >
+              <div className="flex items-center justify-between gap-2">
                 <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
-                  To
+                  Route Planner
                 </p>
-                <Input
-                  placeholder="Search destination"
-                  value={destInput}
-                  onChange={(event) => setDestInput(event.target.value)}
-                  className="flex-1"
-                />
-              </div>
-
-              <div className="flex items-end gap-2">
                 <Button
                   type="button"
-                  size="sm"
-                  variant={originMode === "live" ? "secondary" : "outline"}
-                  onClick={handleUseLiveOrigin}
-                  className="gap-2"
+                  variant="ghost"
+                  size="icon"
+                  className="h-8 w-8 shrink-0"
+                  onClick={() => setPlannerMinimized(true)}
                 >
-                  <LocateFixed className="h-4 w-4" />
-                  My location
-                </Button>
-                <Button
-                  type="submit"
-                  size="sm"
-                  disabled={!destInput.trim()}
-                  className="gap-2"
-                >
-                  <Navigation className="h-4 w-4" />
-                  Go
+                  <ChevronUp className="h-4 w-4" />
                 </Button>
               </div>
-            </div>
 
-            <div className="flex flex-wrap gap-2 text-xs text-muted-foreground">
-              <Badge variant={originMode === "live" ? "secondary" : "outline"} className="text-[10px]">
-                {originMode === "live" ? "Using live location" : "Custom start"}
-              </Badge>
-              <span>
-                {originMode === "live"
-                  ? myLocation
-                    ? "Your route origin updates with your actual location."
-                    : "Waiting for your actual location."
-                  : manualOrigin?.name || "Search for where you're starting from."}
-              </span>
-            </div>
-
-            {(searchingOrigin || searchingDest) && (
-              <p className="text-xs text-muted-foreground">
-                {searchingOrigin ? "Searching starting point…" : "Searching destination…"}
-              </p>
-            )}
-
-            {originSuggestions.length > 0 && (
-              <div className="max-h-56 overflow-auto rounded-lg border bg-popover shadow">
-                {originSuggestions.map((suggestion, index) => (
-                  <button
-                    key={`${suggestion.display_name}-origin-${index}`}
-                    type="button"
-                    className="flex w-full items-start justify-between gap-3 px-3 py-2 text-left text-sm hover:bg-muted"
-                    onClick={() => void handleSelectOrigin(suggestion)}
-                  >
-                    <span className="min-w-0 flex-1">{suggestion.display_name}</span>
-                    {suggestion.category && (
-                      <Badge variant="outline" className="shrink-0 text-[10px]">
-                        {suggestion.category}
-                      </Badge>
-                    )}
-                  </button>
-                ))}
-              </div>
-            )}
-
-            {destSuggestions.length > 0 && (
-              <div className="max-h-56 overflow-auto rounded-lg border bg-popover shadow">
-                {destSuggestions.map((suggestion, index) => (
-                  <button
-                    key={`${suggestion.display_name}-${index}`}
-                    type="button"
-                    className="flex w-full items-start justify-between gap-3 px-3 py-2 text-left text-sm hover:bg-muted"
-                    onClick={() => void handleSelectDestination(suggestion)}
-                  >
-                    <span className="min-w-0 flex-1">{suggestion.display_name}</span>
-                    {suggestion.category && (
-                      <Badge variant="outline" className="shrink-0 text-[10px]">
-                        {suggestion.category}
-                      </Badge>
-                    )}
-                  </button>
-                ))}
-              </div>
-            )}
-
-            {!destInput.trim() && (
-              <div className="rounded-lg border bg-muted/40 p-3">
-                <div className="mb-3 flex items-center justify-between gap-2">
-                  <p className="text-xs font-medium text-muted-foreground">
-                    Quick destination picks
+              <div className="grid gap-2 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]">
+                <div className="space-y-1">
+                  <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+                    From
                   </p>
-                  <Badge variant="secondary" className="text-[10px]">
-                    Tourist spots
-                  </Badge>
+                  <Input
+                    placeholder="Your location or search a starting point"
+                    value={originInput}
+                    onFocus={handleOriginInputFocus}
+                    onChange={(event) => handleOriginInputChange(event.target.value)}
+                    className="flex-1"
+                  />
                 </div>
-                <div className="grid gap-2 sm:grid-cols-2">
-                  {quickDestinationSuggestions.map((suggestion) => (
+
+                <div className="space-y-1">
+                  <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+                    To
+                  </p>
+                  <Input
+                    placeholder="Search destination"
+                    value={destInput}
+                    onChange={(event) => {
+                      setPlannerMinimized(false);
+                      setDestInput(event.target.value);
+                    }}
+                    className="flex-1"
+                  />
+                </div>
+
+                <div className="flex items-end gap-2">
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant={originMode === "live" ? "secondary" : "outline"}
+                    onClick={handleUseLiveOrigin}
+                    className="gap-2"
+                  >
+                    <LocateFixed className="h-4 w-4" />
+                    My location
+                  </Button>
+                  <Button
+                    type="submit"
+                    size="sm"
+                    disabled={!destInput.trim()}
+                    className="gap-2"
+                  >
+                    <Navigation className="h-4 w-4" />
+                    Go
+                  </Button>
+                </div>
+              </div>
+
+              <div className="flex flex-wrap gap-2 text-xs text-muted-foreground">
+                <Badge variant={originMode === "live" ? "secondary" : "outline"} className="text-[10px]">
+                  {originMode === "live" ? "Using live location" : "Custom start"}
+                </Badge>
+                <span>
+                  {originMode === "live"
+                    ? myLocation
+                      ? "Your route origin updates with your actual location."
+                      : "Waiting for your actual location."
+                    : manualOrigin?.name || "Search for where you're starting from."}
+                </span>
+              </div>
+
+              {(searchingOrigin || searchingDest) && (
+                <p className="text-xs text-muted-foreground">
+                  {searchingOrigin ? "Searching starting point…" : "Searching destination…"}
+                </p>
+              )}
+
+              {originSuggestions.length > 0 && (
+                <div className="max-h-56 overflow-auto rounded-lg border bg-popover shadow">
+                  {originSuggestions.map((suggestion, index) => (
                     <button
-                      key={suggestion.display_name}
+                      key={`${suggestion.display_name}-origin-${index}`}
                       type="button"
-                      className="rounded-lg border bg-background px-3 py-2 text-left transition-colors hover:bg-muted"
-                      onClick={() => void handleSelectDestination(suggestion)}
+                      className="flex w-full items-start justify-between gap-3 px-3 py-2 text-left text-sm hover:bg-muted"
+                      onClick={() => void handleSelectOrigin(suggestion)}
                     >
-                      <div className="flex items-center justify-between gap-2">
-                        <span className="line-clamp-2 text-sm font-medium">
-                          {suggestion.display_name}
-                        </span>
-                        {suggestion.category && (
-                          <Badge variant="outline" className="shrink-0 text-[10px]">
-                            {suggestion.category}
-                          </Badge>
-                        )}
-                      </div>
+                      <span className="min-w-0 flex-1">{suggestion.display_name}</span>
+                      {suggestion.category && (
+                        <Badge variant="outline" className="shrink-0 text-[10px]">
+                          {suggestion.category}
+                        </Badge>
+                      )}
                     </button>
                   ))}
                 </div>
-              </div>
-            )}
+              )}
 
-            {routeInfo && (
-              <div className="flex flex-wrap gap-3 text-sm text-muted-foreground">
-                <span className="flex items-center gap-1">
-                  <Ruler className="h-4 w-4" />
-                  {routeInfo.distanceKm.toFixed(1)} km
-                </span>
-                <span className="flex items-center gap-1">
-                  <Clock className="h-4 w-4" />
-                  {Math.round(routeInfo.durationMin)} min
-                </span>
-              </div>
-            )}
+              {destSuggestions.length > 0 && (
+                <div className="max-h-56 overflow-auto rounded-lg border bg-popover shadow">
+                  {destSuggestions.map((suggestion, index) => (
+                    <button
+                      key={`${suggestion.display_name}-${index}`}
+                      type="button"
+                      className="flex w-full items-start justify-between gap-3 px-3 py-2 text-left text-sm hover:bg-muted"
+                      onClick={() => void handleSelectDestination(suggestion)}
+                    >
+                      <span className="min-w-0 flex-1">{suggestion.display_name}</span>
+                      {suggestion.category && (
+                        <Badge variant="outline" className="shrink-0 text-[10px]">
+                          {suggestion.category}
+                        </Badge>
+                      )}
+                    </button>
+                  ))}
+                </div>
+              )}
 
-            {routeError && <p className="text-xs text-amber-600">{routeError}</p>}
+              {!destInput.trim() && (
+                <div className="rounded-lg border bg-muted/40 p-3">
+                  <div className="mb-3 flex items-center justify-between gap-2">
+                    <p className="text-xs font-medium text-muted-foreground">
+                      Quick destination picks
+                    </p>
+                    <Badge variant="secondary" className="text-[10px]">
+                      Tourist spots
+                    </Badge>
+                  </div>
+                  <div className="grid gap-2 sm:grid-cols-2">
+                    {quickDestinationSuggestions.map((suggestion) => (
+                      <button
+                        key={suggestion.display_name}
+                        type="button"
+                        className="rounded-lg border bg-background px-3 py-2 text-left transition-colors hover:bg-muted"
+                        onClick={() => void handleSelectDestination(suggestion)}
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="line-clamp-2 text-sm font-medium">
+                            {suggestion.display_name}
+                          </span>
+                          {suggestion.category && (
+                            <Badge variant="outline" className="shrink-0 text-[10px]">
+                              {suggestion.category}
+                            </Badge>
+                          )}
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
 
-            {locationError && (
-              <p className="text-xs text-destructive">{locationError}</p>
-            )}
-          </form>
+              {routeInfo && (
+                <div className="flex flex-wrap gap-3 text-sm text-muted-foreground">
+                  <span className="flex items-center gap-1">
+                    <Ruler className="h-4 w-4" />
+                    {routeInfo.distanceKm.toFixed(1)} km
+                  </span>
+                  <span className="flex items-center gap-1">
+                    <Clock className="h-4 w-4" />
+                    {Math.round(routeInfo.durationMin)} min
+                  </span>
+                </div>
+              )}
+
+              {routeError && <p className="text-xs text-amber-600">{routeError}</p>}
+
+              {locationError && (
+                <p className="text-xs text-destructive">{locationError}</p>
+              )}
+            </form>
+          )}
         </div>
 
         {isLoadingRoutes && (

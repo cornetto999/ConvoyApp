@@ -18,9 +18,11 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Separator } from "@/components/ui/separator";
 import MapExamplesSection from "@/components/MapExamplesSection";
 import {
+  INITIAL_POSITION_OPTIONS,
   getGeolocationErrorMessage,
   getGeolocationUnsupportedMessage,
   requestCurrentPosition,
+  saveLastKnownLocation,
 } from "@/lib/geolocation";
 import { toast } from "sonner";
 import { Navigation, Route, Users, Zap } from "lucide-react";
@@ -38,6 +40,7 @@ export default function Auth() {
   const [showPassword, setShowPassword] = useState(false);
   const [locationPromptOpen, setLocationPromptOpen] = useState(false);
   const [verificationEmail, setVerificationEmail] = useState<string | null>(null);
+  const [requestingLocation, setRequestingLocation] = useState(false);
   const { signIn, signUp, user } = useAuth();
   const navigate = useNavigate();
   const location = useLocation();
@@ -82,7 +85,7 @@ export default function Auth() {
     navigate("/");
   };
 
-  const handleEnableLocation = () => {
+  const handleEnableLocation = async () => {
     if (!("geolocation" in navigator)) {
       toast.error(getGeolocationUnsupportedMessage("auth"));
       navigateToApp();
@@ -90,15 +93,29 @@ export default function Auth() {
     }
 
     window.localStorage.setItem(LOCATION_PROMPT_SEEN_KEY, "1");
-    void requestCurrentPosition({
-      enableHighAccuracy: true,
-      maximumAge: 10000,
-      timeout: 10000,
-    }).catch((error) => {
-      toast.error(getGeolocationErrorMessage(error, "auth"));
-    });
+    setRequestingLocation(true);
 
-    navigateToApp();
+    try {
+      const position = await requestCurrentPosition(INITIAL_POSITION_OPTIONS);
+      saveLastKnownLocation({
+        lat: position.coords.latitude,
+        lng: position.coords.longitude,
+        heading:
+          typeof position.coords.heading === "number" && !Number.isNaN(position.coords.heading)
+            ? position.coords.heading
+            : 0,
+        speed:
+          typeof position.coords.speed === "number" && !Number.isNaN(position.coords.speed) && position.coords.speed > 0
+            ? position.coords.speed * 3.6
+            : 0,
+        updatedAt: Date.now(),
+      });
+    } catch (error) {
+      toast.error(getGeolocationErrorMessage(error, "auth"));
+    } finally {
+      setRequestingLocation(false);
+      navigateToApp();
+    }
   };
 
   useEffect(() => {
@@ -356,9 +373,11 @@ export default function Auth() {
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
-            <AlertDialogCancel onClick={navigateToApp}>Maybe later</AlertDialogCancel>
-            <AlertDialogAction onClick={handleEnableLocation}>
-              Turn on location
+            <AlertDialogCancel onClick={navigateToApp} disabled={requestingLocation}>
+              Maybe later
+            </AlertDialogCancel>
+            <AlertDialogAction onClick={() => void handleEnableLocation()} disabled={requestingLocation}>
+              {requestingLocation ? "Enabling..." : "Turn on location"}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
