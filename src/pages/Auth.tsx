@@ -19,6 +19,8 @@ import { Separator } from "@/components/ui/separator";
 import MapExamplesSection from "@/components/MapExamplesSection";
 import {
   GEOLOCATION_PERMISSION_DENIED,
+  GEOLOCATION_POSITION_UNAVAILABLE,
+  GEOLOCATION_TIMEOUT,
   INITIAL_POSITION_OPTIONS,
   getGeolocationErrorMessage,
   getGeolocationUnsupportedMessage,
@@ -135,6 +137,16 @@ export default function Auth() {
       if (locationRequestError.code === GEOLOCATION_PERMISSION_DENIED) {
         markLocationPromptSeen();
         toast.error(message);
+        navigateToApp();
+        return;
+      }
+
+      if (
+        locationRequestError.code === GEOLOCATION_POSITION_UNAVAILABLE ||
+        locationRequestError.code === GEOLOCATION_TIMEOUT
+      ) {
+        markLocationPromptSeen();
+        toast.message("Location access is on. Convoy will keep trying while your GPS gets a fix.");
         navigateToApp();
         return;
       }

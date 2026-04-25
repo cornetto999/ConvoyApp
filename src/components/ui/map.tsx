@@ -19,7 +19,11 @@ import { createPortal } from "react-dom";
 import { X, Minus, Plus, Locate, Maximize, Loader2 } from "lucide-react";
 import { toast } from "sonner";
 
-import { getGeolocationErrorMessage, getGeolocationUnsupportedMessage } from "@/lib/geolocation";
+import {
+  INITIAL_POSITION_OPTIONS,
+  getGeolocationErrorMessage,
+  getGeolocationUnsupportedMessage,
+} from "@/lib/geolocation";
 import { cn } from "@/lib/utils";
 
 const defaultStyles = {
@@ -816,7 +820,7 @@ function MapControls({
           toast.error(getGeolocationErrorMessage(error, "locate"));
           setWaitingForLocation(false);
         },
-        { enableHighAccuracy: true, maximumAge: 10000, timeout: 10000 },
+        INITIAL_POSITION_OPTIONS,
       );
       return;
     }

@@ -2,17 +2,19 @@ export const GEOLOCATION_PERMISSION_DENIED = 1;
 export const GEOLOCATION_POSITION_UNAVAILABLE = 2;
 export const GEOLOCATION_TIMEOUT = 3;
 export const LAST_KNOWN_LOCATION_KEY = "convoy.last_known_location";
+export const GEOLOCATION_MAX_RETRIES = 5;
+export const GEOLOCATION_RETRY_DELAY_MS = 1500;
 
 export const INITIAL_POSITION_OPTIONS: PositionOptions = {
   enableHighAccuracy: true,
   maximumAge: 0,
-  timeout: 20_000,
+  timeout: 10_000,
 };
 
 export const WATCH_POSITION_OPTIONS: PositionOptions = {
   enableHighAccuracy: true,
   maximumAge: 0,
-  timeout: 20_000,
+  timeout: 10_000,
 };
 
 export type PersistedLocation = {
@@ -26,6 +28,20 @@ export type PersistedLocation = {
 export type GeolocationErrorLike = {
   code?: number;
   message?: string | null;
+};
+
+export type GeolocationPermissionState =
+  | PermissionState
+  | "unsupported"
+  | "unknown";
+
+export type ApproximateLocation = {
+  lat: number;
+  lng: number;
+  city: string | null;
+  region: string | null;
+  country: string | null;
+  source: "ipapi" | "ipwhois";
 };
 
 type GeolocationMessageContext = "auth" | "tracking" | "locate";
@@ -66,6 +82,106 @@ export function requestCurrentPosition(options?: PositionOptions) {
 
     navigator.geolocation.getCurrentPosition(resolve, reject, options);
   });
+}
+
+export async function getLocationPermissionState(): Promise<GeolocationPermissionState> {
+  if (typeof navigator === "undefined" || !("geolocation" in navigator)) {
+    console.log("Geolocation permission state:", "unsupported");
+    return "unsupported";
+  }
+
+  if (!("permissions" in navigator) || !navigator.permissions?.query) {
+    console.log("Geolocation permission state:", "unknown");
+    return "unknown";
+  }
+
+  try {
+    const permissionStatus = await navigator.permissions.query({
+      name: "geolocation" as PermissionName,
+    });
+    console.log("Geolocation permission state:", permissionStatus.state);
+    return permissionStatus.state;
+  } catch (error) {
+    console.warn("Unable to query geolocation permission state:", error);
+    return "unknown";
+  }
+}
+
+async function fetchWithTimeout(url: string, timeoutMs = 6000) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    return await fetch(url, {
+      signal: controller.signal,
+      headers: {
+        Accept: "application/json",
+      },
+    });
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+export async function fetchApproximateLocation(): Promise<ApproximateLocation | null> {
+  try {
+    const ipApiResponse = await fetchWithTimeout("https://ipapi.co/json/");
+    if (ipApiResponse.ok) {
+      const data = (await ipApiResponse.json()) as {
+        latitude?: number;
+        longitude?: number;
+        city?: string | null;
+        region?: string | null;
+        country_name?: string | null;
+      };
+
+      if (typeof data.latitude === "number" && typeof data.longitude === "number") {
+        return {
+          lat: data.latitude,
+          lng: data.longitude,
+          city: data.city ?? null,
+          region: data.region ?? null,
+          country: data.country_name ?? null,
+          source: "ipapi",
+        };
+      }
+    }
+  } catch (error) {
+    console.warn("Approximate location lookup failed via ipapi:", error);
+  }
+
+  try {
+    const ipWhoIsResponse = await fetchWithTimeout("https://ipwho.is/");
+    if (ipWhoIsResponse.ok) {
+      const data = (await ipWhoIsResponse.json()) as {
+        success?: boolean;
+        latitude?: number;
+        longitude?: number;
+        city?: string | null;
+        region?: string | null;
+        country?: string | null;
+      };
+
+      if (
+        data.success !== false &&
+        typeof data.latitude === "number" &&
+        typeof data.longitude === "number"
+      ) {
+        return {
+          lat: data.latitude,
+          lng: data.longitude,
+          city: data.city ?? null,
+          region: data.region ?? null,
+          country: data.country ?? null,
+          source: "ipwhois",
+        };
+      }
+    }
+  } catch (error) {
+    console.warn("Approximate location lookup failed via ipwho.is:", error);
+  }
+
+  return null;
 }
 
 export function saveLastKnownLocation(location: PersistedLocation) {

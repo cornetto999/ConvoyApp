@@ -31,12 +31,19 @@ import {
   type DestinationSuggestion,
 } from "@/lib/destination-suggestions";
 import {
+  GEOLOCATION_MAX_RETRIES,
   GEOLOCATION_PERMISSION_DENIED,
   GEOLOCATION_POSITION_UNAVAILABLE,
+  GEOLOCATION_RETRY_DELAY_MS,
   GEOLOCATION_TIMEOUT,
+  INITIAL_POSITION_OPTIONS,
   WATCH_POSITION_OPTIONS,
+  fetchApproximateLocation,
+  getLocationPermissionState,
   getGeolocationUnsupportedMessage,
   saveLastKnownLocation,
+  type ApproximateLocation,
+  type GeolocationPermissionState,
 } from "@/lib/geolocation";
 import {
   Map as AppMap,
@@ -91,8 +98,6 @@ const DEFAULT_VIEWPORT: MapViewport = {
 };
 const REROUTE_THRESHOLD_METERS = 50;
 const LIVE_ORIGIN_LABEL = "Your location";
-const GEOLOCATION_RETRY_INTERVAL_MS = 5000;
-const FALLBACK_AFTER_RETRIES = 3;
 const MOBILE_GPS_HINT = "Keep this screen open while your phone gets a GPS lock.";
 const DESKTOP_GPS_HINT =
   "Desktop browsers often estimate location from Wi-Fi or IP. For the best convoy accuracy, use a phone with GPS enabled.";
@@ -261,6 +266,10 @@ export default function ConvoyMap() {
   const [locationLoading, setLocationLoading] = useState(true);
   const [locationStatusMessage, setLocationStatusMessage] = useState("📍 Getting your location...");
   const [locationHint, setLocationHint] = useState<string | null>(null);
+  const [locationPermissionState, setLocationPermissionState] =
+    useState<GeolocationPermissionState>("unknown");
+  const [locationSource, setLocationSource] = useState<"gps" | "approximate" | "fallback" | null>(null);
+  const [approximateLocationLabel, setApproximateLocationLabel] = useState<string | null>(null);
   const [retryCount, setRetryCount] = useState(0);
   const [usingFallbackLocation, setUsingFallbackLocation] = useState(false);
   const [requestingLocationAccess, setRequestingLocationAccess] = useState(false);
@@ -293,7 +302,10 @@ export default function ConvoyMap() {
   const retryCountRef = useRef(0);
   const usingFallbackLocationRef = useRef(false);
   const forceRecenterOnNextFixRef = useRef(false);
+  const requestPreciseLocationRef =
+    useRef<(attemptNumber: number, options?: TrackingStartOptions) => void>(() => {});
   const startLocationTrackingRef = useRef<(options?: TrackingStartOptions) => void>(() => {});
+  const preciseLocationResolvedRef = useRef(false);
   const latestPositionRef = useRef<{
     lat: number;
     lng: number;
@@ -313,17 +325,36 @@ export default function ConvoyMap() {
   const routeOriginLabel =
     originMode === "live"
       ? myLocation
-        ? "My location"
+        ? locationSource === "approximate"
+          ? "Approximate location"
+          : locationSource === "fallback"
+            ? "Mindanao fallback"
+            : "My location"
         : usingFallbackLocation
-          ? "Mindanao fallback"
+          ? "Approximate location"
           : "Locating..."
       : manualOrigin?.name || originInput.trim() || "Custom start";
   const routeDestinationLabel = destination?.name || destInput.trim() || "No destination";
   const liveOriginWaitingMessage = requiresHttps
     ? "Geolocation requires HTTPS. Open the app securely or set a custom starting point."
-    : usingFallbackLocation
-      ? "Using Davao City as the Mindanao fallback while we keep looking for your live GPS. You can also set a custom starting point."
+    : locationPermissionState === "denied"
+      ? "Please enable location access or set a custom starting point."
+      : locationSource === "approximate"
+        ? `Using an approximate location${approximateLocationLabel ? ` near ${approximateLocationLabel}` : ""} while we keep looking for your GPS. You can also set a custom starting point.`
+        : locationSource === "fallback"
+          ? "Using Davao City as a temporary Mindanao fallback while we keep trying to locate you."
       : "Looking for your live location. Keep the map open or choose a custom starting point.";
+  const locationCoordinatesLabel = myLocation
+    ? `Lat ${myLocation.lat.toFixed(5)}, Lng ${myLocation.lng.toFixed(5)}`
+    : null;
+  const locationSourceLabel =
+    locationSource === "gps"
+      ? "Live GPS"
+      : locationSource === "approximate"
+        ? "Approximate Location"
+        : locationSource === "fallback"
+          ? "Fallback center"
+          : "Searching";
 
   const sortedRoutes = useMemo(
     () =>
@@ -507,7 +538,10 @@ export default function ConvoyMap() {
       supabase.removeChannel(channel);
       clearLocationRetryTimer();
       clearLocationWatch();
-      if (locationIntervalRef.current) clearInterval(locationIntervalRef.current);
+      if (locationIntervalRef.current) {
+        clearInterval(locationIntervalRef.current);
+        locationIntervalRef.current = null;
+      }
       window.removeEventListener("focus", retryTracking);
       window.removeEventListener("online", retryTracking);
       document.removeEventListener("visibilitychange", retryTracking);
@@ -631,11 +665,15 @@ export default function ConvoyMap() {
     });
 
     latestPositionRef.current = next;
+    preciseLocationResolvedRef.current = true;
     setMyLocation({ lat: next.lat, lng: next.lng });
     setLocationLoading(false);
     setLocationError(null);
     setLocationStatusMessage("✅ Location acquired");
-    setLocationHint(isMobileDevice ? null : DESKTOP_GPS_HINT);
+    setLocationHint(isMobileDevice ? "Live GPS connected." : DESKTOP_GPS_HINT);
+    setLocationPermissionState("granted");
+    setLocationSource("gps");
+    setApproximateLocationLabel(null);
     setRetryCount(0);
     retryCountRef.current = 0;
     setRequestingLocationAccess(false);
@@ -717,11 +755,22 @@ export default function ConvoyMap() {
     }
   }, []);
 
+  const clearLocationKeepAlive = useCallback(() => {
+    if (locationIntervalRef.current) {
+      clearInterval(locationIntervalRef.current);
+      locationIntervalRef.current = null;
+    }
+  }, []);
+
+  // If precise GPS is still unavailable after several attempts, fall back to an
+  // approximate network-based location so the map stays usable.
   const applyFallbackLocation = useCallback((hint?: string) => {
-    const shouldMoveToFallback = !usingFallbackLocationRef.current && !latestPositionRef.current;
+    const shouldMoveToFallback = !preciseLocationResolvedRef.current;
 
     usingFallbackLocationRef.current = true;
     setUsingFallbackLocation(true);
+    setLocationSource("fallback");
+    setApproximateLocationLabel("Davao City, Mindanao");
     setLocationLoading(false);
     setLocationStatusMessage("⚠️ Using fallback location");
     setLocationHint(
@@ -729,6 +778,7 @@ export default function ConvoyMap() {
     );
 
     if (shouldMoveToFallback) {
+      setMyLocation(FALLBACK_LOCATION);
       setViewport((current) => ({
         ...current,
         center: [FALLBACK_LOCATION.lng, FALLBACK_LOCATION.lat],
@@ -737,12 +787,201 @@ export default function ConvoyMap() {
     }
   }, []);
 
-  const scheduleLocationRetry = useCallback((options: TrackingStartOptions = {}) => {
+  const applyApproximateLocation = useCallback((location: ApproximateLocation, hint?: string) => {
+    const label = [location.city, location.region, location.country]
+      .filter(Boolean)
+      .join(", ");
+    const shouldMoveToApproximate = !preciseLocationResolvedRef.current;
+
+    console.log("Approximate location fallback:", {
+      lat: location.lat,
+      lng: location.lng,
+      label,
+      source: location.source,
+    });
+
+    usingFallbackLocationRef.current = true;
+    setUsingFallbackLocation(true);
+    setLocationSource("approximate");
+    setApproximateLocationLabel(label || "your network area");
+    setLocationLoading(false);
+    setLocationError((current) =>
+      locationPermissionState === "denied" ? current ?? "Please enable location access" : null,
+    );
+    setLocationStatusMessage("⚠️ Using Approximate Location");
+    setLocationHint(
+      hint ??
+        `Based on your network${label ? ` near ${label}` : ""}. We're still trying to get your precise GPS location.`,
+    );
+
+    if (shouldMoveToApproximate) {
+      setMyLocation({ lat: location.lat, lng: location.lng });
+      setViewport((current) => ({
+        ...current,
+        center: [location.lng, location.lat],
+        zoom: Math.max(current.zoom, 12),
+      }));
+    }
+  }, [locationPermissionState]);
+
+  const applyApproximateFallback = useCallback(async (hint?: string) => {
+    if (preciseLocationResolvedRef.current) return;
+
+    const approximateLocation = await fetchApproximateLocation();
+
+    if (approximateLocation) {
+      applyApproximateLocation(approximateLocation, hint);
+      return;
+    }
+
+    applyFallbackLocation(hint);
+  }, [applyApproximateLocation, applyFallbackLocation]);
+
+  const scheduleLocationRetry = useCallback((attemptNumber: number, options: TrackingStartOptions = {}) => {
     clearLocationRetryTimer();
+    console.log(`Geolocation retry ${attemptNumber} scheduled in ${GEOLOCATION_RETRY_DELAY_MS}ms`);
     retryTimeoutRef.current = setTimeout(() => {
-      startLocationTrackingRef.current(options);
-    }, GEOLOCATION_RETRY_INTERVAL_MS);
+      requestPreciseLocationRef.current(attemptNumber, options);
+    }, GEOLOCATION_RETRY_DELAY_MS);
   }, [clearLocationRetryTimer]);
+
+  const ensureLocationWatch = useCallback((options: TrackingStartOptions = {}) => {
+    if (typeof navigator === "undefined" || !("geolocation" in navigator) || watchIdRef.current !== null) {
+      return;
+    }
+
+    watchIdRef.current = navigator.geolocation.watchPosition(
+      (position) => {
+        clearLocationRetryTimer();
+        syncCurrentPosition(position.coords);
+      },
+      (error) => {
+        console.warn("Geolocation watch error:", {
+          code: error.code,
+          message: error.message,
+        });
+
+        setRequestingLocationAccess(false);
+
+        if (error.code === GEOLOCATION_PERMISSION_DENIED) {
+          setLocationPermissionState("denied");
+          clearLocationRetryTimer();
+          clearLocationWatch();
+          setLocationLoading(false);
+          setLocationError("Please enable location access");
+          setLocationStatusMessage("⚠️ Location access needed");
+          setLocationHint(
+            "Open your browser or device settings, allow location access, then tap Retry Location.",
+          );
+          void applyApproximateFallback(
+            "Location access is off. Showing an approximate location until GPS permission is enabled.",
+          );
+          return;
+        }
+
+        if (!preciseLocationResolvedRef.current) {
+          setLocationError(getTrackingLocationErrorMessage(error.code));
+          setLocationStatusMessage("📡 Weak signal, retrying...");
+          setLocationHint(defaultLocationHint);
+          if (!retryTimeoutRef.current && retryCountRef.current < GEOLOCATION_MAX_RETRIES) {
+            scheduleLocationRetry(retryCountRef.current + 1, options);
+          }
+          return;
+        }
+
+        setLocationLoading(true);
+        setLocationError(getTrackingLocationErrorMessage(error.code));
+        setLocationStatusMessage("📡 Weak signal, retrying...");
+        setLocationHint("Signal dropped. Keep the screen open while we reconnect to GPS.");
+
+        if (!retryTimeoutRef.current) {
+          retryCountRef.current = 0;
+          setRetryCount(0);
+          scheduleLocationRetry(1, options);
+        }
+      },
+      WATCH_POSITION_OPTIONS,
+    );
+  }, [
+    applyApproximateFallback,
+    clearLocationRetryTimer,
+    clearLocationWatch,
+    defaultLocationHint,
+    scheduleLocationRetry,
+    syncCurrentPosition,
+  ]);
+
+  const requestPreciseLocation = useCallback((attemptNumber: number, options: TrackingStartOptions = {}) => {
+    if (typeof navigator === "undefined" || !("geolocation" in navigator)) {
+      return;
+    }
+
+    console.log(`Geolocation retry attempt ${attemptNumber} of ${GEOLOCATION_MAX_RETRIES}`);
+    setLocationLoading(true);
+    setLocationStatusMessage(
+      attemptNumber > 1 ? "📡 Weak signal, retrying..." : "📍 Getting your location...",
+    );
+
+    navigator.geolocation.getCurrentPosition(
+      (position) => {
+        clearLocationRetryTimer();
+        syncCurrentPosition(position.coords);
+        ensureLocationWatch(options);
+      },
+      (error) => {
+        console.warn("Geolocation request error:", {
+          attempt: attemptNumber,
+          code: error.code,
+          message: error.message,
+        });
+
+        setRequestingLocationAccess(false);
+
+        if (error.code === GEOLOCATION_PERMISSION_DENIED) {
+          setLocationPermissionState("denied");
+          clearLocationRetryTimer();
+          clearLocationWatch();
+          setLocationLoading(false);
+          setLocationError("Please enable location access");
+          setLocationStatusMessage("⚠️ Location access needed");
+          setLocationHint(
+            "Open your browser or device settings, allow location access, then tap Retry Location.",
+          );
+          void applyApproximateFallback(
+            "Location permission is denied. Showing an approximate location until access is enabled.",
+          );
+          return;
+        }
+
+        retryCountRef.current = attemptNumber;
+        setRetryCount(attemptNumber);
+        setLocationError(getTrackingLocationErrorMessage(error.code));
+        setLocationHint(defaultLocationHint);
+
+        if (attemptNumber < GEOLOCATION_MAX_RETRIES) {
+          setLocationStatusMessage("📡 Weak signal, retrying...");
+          scheduleLocationRetry(attemptNumber + 1, options);
+          return;
+        }
+
+        setLocationLoading(false);
+        void applyApproximateFallback(
+          "We couldn't get a precise GPS fix yet. Showing an approximate location while GPS keeps trying in the background.",
+        );
+      },
+      INITIAL_POSITION_OPTIONS,
+    );
+  }, [
+    applyApproximateFallback,
+    clearLocationRetryTimer,
+    clearLocationWatch,
+    defaultLocationHint,
+    ensureLocationWatch,
+    scheduleLocationRetry,
+    syncCurrentPosition,
+  ]);
+
+  requestPreciseLocationRef.current = requestPreciseLocation;
 
   const startLocationTracking = useCallback((options: TrackingStartOptions = {}) => {
     forceRecenterOnNextFixRef.current = Boolean(options.forceRecenter);
@@ -754,14 +993,18 @@ export default function ConvoyMap() {
     }
 
     if (requiresHttps) {
-      const message = "Geolocation requires HTTPS";
-      console.warn("Geolocation error:", { code: "https", message });
+      console.warn("Geolocation error:", { code: "https", message: "Geolocation requires HTTPS" });
       clearLocationRetryTimer();
       clearLocationWatch();
+      clearLocationKeepAlive();
+      setLocationPermissionState("unknown");
       setLocationLoading(false);
-      setLocationError(message);
+      setLocationError("Geolocation requires HTTPS");
+      setLocationStatusMessage("⚠️ Location unavailable");
       setRequestingLocationAccess(false);
-      applyFallbackLocation("Open this app over HTTPS to use live convoy tracking.");
+      void applyApproximateFallback(
+        "Geolocation requires HTTPS. Showing an approximate location until the app is opened securely.",
+      );
       return;
     }
 
@@ -770,88 +1013,63 @@ export default function ConvoyMap() {
       console.warn("Geolocation error:", { code: "unsupported", message });
       clearLocationRetryTimer();
       clearLocationWatch();
+      clearLocationKeepAlive();
+      setLocationPermissionState("unsupported");
       setLocationLoading(false);
       setLocationError(message);
+      setLocationStatusMessage("⚠️ Location unavailable");
       setRequestingLocationAccess(false);
-      applyFallbackLocation(defaultLocationHint);
+      void applyApproximateFallback(
+        "This device does not support precise browser geolocation. Showing an approximate location instead.",
+      );
       return;
     }
 
     clearLocationRetryTimer();
-    clearLocationWatch();
     setLocationLoading(true);
-    setLocationStatusMessage(
-      retryCountRef.current > 0 ? "📡 Weak signal, retrying..." : "📍 Getting your location...",
-    );
+    setLocationStatusMessage("📍 Getting your location...");
+    setLocationHint(defaultLocationHint);
 
-    watchIdRef.current = navigator.geolocation.watchPosition(
-      (position) => {
-        clearLocationRetryTimer();
-        syncCurrentPosition(position.coords);
-      },
-      (error) => {
-        console.warn("Geolocation error:", {
-          code: error.code,
-          message: error.message,
-        });
+    void (async () => {
+      const permissionState = await getLocationPermissionState();
+      setLocationPermissionState(permissionState);
 
+      if (permissionState === "denied") {
+        setLocationLoading(false);
+        setLocationError("Please enable location access");
+        setLocationStatusMessage("⚠️ Location access needed");
+        setLocationHint(
+          "Open your browser or device settings, allow location access, then tap Retry Location.",
+        );
         setRequestingLocationAccess(false);
-
-        if (error.code === GEOLOCATION_PERMISSION_DENIED) {
-          clearLocationRetryTimer();
-          clearLocationWatch();
-          setLocationLoading(false);
-          setLocationError(getTrackingLocationErrorMessage(error.code));
-          setLocationHint(
-            "Open your browser or device settings, allow location access, then tap Retry Location.",
-          );
-
-          if (!latestPositionRef.current) {
-            applyFallbackLocation(
-              "Location access is required for live convoy tracking. You can still browse the map with the fallback center.",
-            );
-          }
-
-          return;
-        }
-
-        const nextRetryCount = retryCountRef.current + 1;
-        retryCountRef.current = nextRetryCount;
-        setRetryCount(nextRetryCount);
-        setLocationError(getTrackingLocationErrorMessage(error.code));
-        setLocationStatusMessage("📡 Weak signal, retrying...");
-        setLocationHint(defaultLocationHint);
-        setLocationLoading(true);
         clearLocationWatch();
+        void applyApproximateFallback(
+          "Location access is disabled. Showing an approximate location until permission is enabled.",
+        );
+        return;
+      }
 
-        if (nextRetryCount >= FALLBACK_AFTER_RETRIES && !latestPositionRef.current) {
-          applyFallbackLocation("Still trying to get your actual location in the background.");
-        }
+      ensureLocationWatch(options);
+      requestPreciseLocationRef.current(1, options);
 
-        scheduleLocationRetry(options);
-      },
-      WATCH_POSITION_OPTIONS,
-    );
-
-    if (locationIntervalRef.current) {
-      clearInterval(locationIntervalRef.current);
-    }
-
-    locationIntervalRef.current = setInterval(() => {
-      if (!latestPositionRef.current) return;
-      void pushLocationUpdate(latestPositionRef.current).catch((error) => {
-        console.warn("Failed to keep location alive:", error);
-      });
-    }, 5000);
+      if (!locationIntervalRef.current) {
+        locationIntervalRef.current = setInterval(() => {
+          if (!latestPositionRef.current) return;
+          void pushLocationUpdate(latestPositionRef.current).catch((error) => {
+            console.warn("Failed to keep location alive:", error);
+          });
+        }, 5000);
+      }
+    })();
   }, [
-    applyFallbackLocation,
+    applyApproximateFallback,
+    clearLocationKeepAlive,
     clearLocationRetryTimer,
     clearLocationWatch,
     defaultLocationHint,
+    ensureLocationWatch,
     pushLocationUpdate,
     requiresHttps,
-    scheduleLocationRetry,
-    syncCurrentPosition,
   ]);
 
   startLocationTrackingRef.current = startLocationTracking;
@@ -867,6 +1085,9 @@ export default function ConvoyMap() {
   const handleUseMyLocationAgain = () => {
     setCameraLocked(false);
     setRouteError(null);
+    retryCountRef.current = 0;
+    setRetryCount(0);
+    setLocationStatusMessage("📍 Getting your location...");
 
     if (myLocation) {
       hasCenteredOnUserRef.current = true;
@@ -1676,6 +1897,9 @@ export default function ConvoyMap() {
                 {locationError && (
                   <p className="mt-1 text-xs text-destructive">{locationError}</p>
                 )}
+                {locationCoordinatesLabel && (
+                  <p className="mt-1 text-xs text-muted-foreground">{locationCoordinatesLabel}</p>
+                )}
                 {locationHint && (
                   <p className="mt-1 text-xs text-muted-foreground">{locationHint}</p>
                 )}
@@ -1684,7 +1908,10 @@ export default function ConvoyMap() {
                     Retries: {retryCount}
                   </span>
                   <span className="rounded-full border px-2 py-1">
-                    {myLocation ? "Live GPS" : usingFallbackLocation ? "Fallback center" : "Searching"}
+                    {locationSourceLabel}
+                  </span>
+                  <span className="rounded-full border px-2 py-1">
+                    Permission: {locationPermissionState}
                   </span>
                 </div>
               </div>
