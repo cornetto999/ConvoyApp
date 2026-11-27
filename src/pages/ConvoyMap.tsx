@@ -24,27 +24,12 @@ import { supabase } from "@/integrations/supabase/client";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import {
-  getCuratedDestinationSuggestions,
-  getQuickDestinationSuggestions,
-  mergeDestinationSuggestions,
-  type DestinationSuggestion,
-} from "@/lib/destination-suggestions";
-import {
-  GEOLOCATION_MAX_RETRIES,
-  GEOLOCATION_PERMISSION_DENIED,
-  GEOLOCATION_POSITION_UNAVAILABLE,
-  GEOLOCATION_RETRY_DELAY_MS,
-  GEOLOCATION_TIMEOUT,
-  INITIAL_POSITION_OPTIONS,
-  WATCH_POSITION_OPTIONS,
-  fetchApproximateLocation,
-  getLocationPermissionState,
-  getGeolocationUnsupportedMessage,
-  saveLastKnownLocation,
-  type ApproximateLocation,
-  type GeolocationPermissionState,
-} from "@/lib/geolocation";
+import { useConvoyPosition } from "@/hooks/use-convoy-position";
+import { useConvoyPlaceSearch } from "@/hooks/use-convoy-place-search";
+import { coordinateSuggestion, parseCoordinateSuggestion } from "@/lib/convoy-place-search";
+import { accuracyOutline, isRoutingFix, isValidCoordinate, type Coordinate } from "@/lib/convoy-position";
+import { getQuickDestinationSuggestions, type DestinationSuggestion } from "@/lib/destination-suggestions";
+import { getGeolocationErrorMessage } from "@/lib/geolocation";
 import {
   Map as AppMap,
   MapClusterLayer,
@@ -60,7 +45,6 @@ import {
 import type { Convoy, ConvoyMember, MemberLocation, Profile } from "@/types/convoy";
 
 type MemberWithProfile = ConvoyMember & { profiles: Profile | null };
-type Coordinate = { lat: number; lng: number };
 type NamedCoordinate = Coordinate & { name: string };
 type RouteCoordinate = [number, number];
 type RouteOption = {
@@ -83,13 +67,7 @@ type GapAlert = {
   coordinates: RouteCoordinate;
   gapMeters: number;
 };
-type TrackingStartOptions = {
-  manual?: boolean;
-  forceRecenter?: boolean;
-};
-
-const FALLBACK_LOCATION: Coordinate = { lat: 7.0731, lng: 125.6128 };
-const DEFAULT_CENTER: Coordinate = FALLBACK_LOCATION;
+const DEFAULT_CENTER: Coordinate = { lat: 7.0731, lng: 125.6128 };
 const DEFAULT_VIEWPORT: MapViewport = {
   center: [DEFAULT_CENTER.lng, DEFAULT_CENTER.lat],
   zoom: 13,
@@ -98,9 +76,6 @@ const DEFAULT_VIEWPORT: MapViewport = {
 };
 const REROUTE_THRESHOLD_METERS = 50;
 const LIVE_ORIGIN_LABEL = "Your location";
-const MOBILE_GPS_HINT = "Keep this screen open while your phone gets a GPS lock.";
-const DESKTOP_GPS_HINT =
-  "Desktop browsers often estimate location from Wi-Fi or IP. For the best convoy accuracy, use a phone with GPS enabled.";
 
 function haversineMeters(a: Coordinate, b: Coordinate) {
   const R = 6371e3;
@@ -127,36 +102,6 @@ function formatDuration(seconds: number) {
 function formatDistance(meters: number) {
   if (meters < 1000) return `${Math.round(meters)} m`;
   return `${(meters / 1000).toFixed(1)} km`;
-}
-
-function normalizeSuggestionLabel(value: string) {
-  return value.trim().toLowerCase();
-}
-
-function isLocalhost(hostname: string) {
-  return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1";
-}
-
-function isLikelyMobileDevice() {
-  if (typeof navigator === "undefined") return true;
-
-  return (
-    /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent) ||
-    navigator.maxTouchPoints > 1
-  );
-}
-
-function getTrackingLocationErrorMessage(code?: number) {
-  switch (code) {
-    case GEOLOCATION_PERMISSION_DENIED:
-      return "Permission denied. Please allow location access.";
-    case GEOLOCATION_POSITION_UNAVAILABLE:
-      return "Location unavailable. Try moving outdoors or enabling GPS.";
-    case GEOLOCATION_TIMEOUT:
-      return "Location request timed out. Retrying...";
-    default:
-      return "Location unavailable. Try moving outdoors or enabling GPS.";
-  }
 }
 
 function getBearingDegrees(from: Coordinate, to: Coordinate) {
@@ -211,6 +156,109 @@ function ConvoyMarkerPin({
   );
 }
 
+/** Google Maps–style GPS blue dot with heading direction cone */
+function CurrentLocationMarker({ heading, precise }: { heading: number | null; precise: boolean }) {
+  return (
+    <div className="relative flex items-center justify-center" style={{ width: 56, height: 56 }}>
+      {/* Accuracy pulse ring */}
+      <span
+        className={precise ? "absolute inset-0 rounded-full motion-safe:animate-ping" : "hidden"}
+        style={{ backgroundColor: "rgba(59,130,246,0.18)", animationDuration: "2s" }}
+      />
+      {/* Soft glow halo */}
+      <span
+        className="absolute rounded-full"
+        style={{
+          width: 36,
+          height: 36,
+          background: "radial-gradient(circle, rgba(59,130,246,0.25) 0%, transparent 70%)",
+        }}
+      />
+      {/* Heading cone - points in direction of travel */}
+      {heading !== null && precise && (
+        <div
+          className="absolute inset-0 flex items-center justify-center"
+          style={{ transform: `rotate(${heading}deg)` }}
+        >
+          <div
+            style={{
+              width: 0,
+              height: 0,
+              borderLeft: "7px solid transparent",
+              borderRight: "7px solid transparent",
+              borderBottom: "22px solid rgba(59,130,246,0.55)",
+              position: "absolute",
+              bottom: "50%",
+              marginBottom: 10,
+            }}
+          />
+        </div>
+      )}
+      {/* Blue dot */}
+      <div
+        className="relative z-10 rounded-full border-[3px] border-white shadow-lg"
+        style={{
+          width: 20,
+          height: 20,
+          background: precise ? "#2563eb" : "#64748b",
+          boxShadow: "0 2px 8px rgba(59,130,246,0.6), 0 0 0 3px white",
+        }}
+      />
+    </div>
+  );
+}
+
+/** Destination flag pin with a proper pin shape */
+function DestinationMarker({ label }: { label?: string }) {
+  return (
+    <div className="relative flex flex-col items-center" style={{ transform: "translateY(-4px)" }}>
+      {/* Label chip */}
+      {label && (
+        <div
+          className="absolute whitespace-nowrap rounded-full border border-border/80 bg-background/95 px-2.5 py-1 text-[11px] font-semibold shadow-md backdrop-blur-sm"
+          style={{ bottom: "calc(100% + 6px)", left: "50%", transform: "translateX(-50%)" }}
+        >
+          {label}
+        </div>
+      )}
+      {/* Pin body */}
+      <div
+        className="flex items-center justify-center rounded-full border-2 border-white text-white shadow-xl"
+        style={{
+          width: 36,
+          height: 36,
+          background: "linear-gradient(135deg, #f43f5e 0%, #be123c 100%)",
+          boxShadow: "0 4px 12px rgba(244,63,94,0.5), 0 0 0 2px white",
+        }}
+      >
+        {/* Flag icon */}
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+          <path d="M14.4 6L14 4H5v17h2v-7h5.6l.4 2h7V6h-5.6z" />
+        </svg>
+      </div>
+      {/* Pin tail */}
+      <div
+        style={{
+          width: 3,
+          height: 10,
+          background: "linear-gradient(to bottom, #be123c, rgba(190,18,60,0.3))",
+          borderRadius: "0 0 2px 2px",
+          marginTop: -1,
+        }}
+      />
+      {/* Pin shadow */}
+      <div
+        style={{
+          width: 10,
+          height: 3,
+          background: "radial-gradient(ellipse, rgba(0,0,0,0.25) 0%, transparent 70%)",
+          marginTop: 1,
+        }}
+      />
+    </div>
+  );
+}
+
 function ViewportHud({ viewport }: { viewport: MapViewport }) {
   return (
     <div className="bg-background/85 absolute top-3 left-3 z-20 flex max-w-[calc(100vw-2rem)] flex-wrap gap-x-3 gap-y-1 rounded-lg border px-3 py-2 font-mono text-[11px] shadow-lg backdrop-blur">
@@ -246,7 +294,6 @@ export default function ConvoyMap() {
   const [convoy, setConvoy] = useState<Convoy | null>(null);
   const [members, setMembers] = useState<MemberWithProfile[]>([]);
   const [locations, setLocations] = useState<MemberLocation[]>([]);
-  const [myLocation, setMyLocation] = useState<Coordinate | null>(null);
   const [showMembers, setShowMembers] = useState(false);
   const [routeOptions, setRouteOptions] = useState<RouteOption[]>([]);
   const [selectedRouteIndex, setSelectedRouteIndex] = useState(0);
@@ -254,25 +301,14 @@ export default function ConvoyMap() {
   const [routeOrigin, setRouteOrigin] = useState<Coordinate | null>(null);
   const [originMode, setOriginMode] = useState<"live" | "manual">("live");
   const [originInput, setOriginInput] = useState(LIVE_ORIGIN_LABEL);
-  const [originSuggestions, setOriginSuggestions] = useState<DestinationSuggestion[]>([]);
-  const [searchingOrigin, setSearchingOrigin] = useState(false);
   const [manualOrigin, setManualOrigin] = useState<NamedCoordinate | null>(null);
-  const [destInput, setDestInput] = useState("");
-  const [destSuggestions, setDestSuggestions] = useState<DestinationSuggestion[]>([]);
-  const [searchingDest, setSearchingDest] = useState(false);
-  const [destination, setDestination] = useState<{ name: string; lat: number; lng: number } | null>(null);
+  const [destination, setDestination] = useState<NamedCoordinate | null>(null);
+  const [destinationDraft, setDestinationDraft] = useState<string | null>(null);
+  const [selectedDestination, setSelectedDestination] = useState<NamedCoordinate | null>(null);
+  const [applyingRoute, setApplyingRoute] = useState(false);
+  const [pinTarget, setPinTarget] = useState<"from" | "to" | null>(null);
   const [routeError, setRouteError] = useState<string | null>(null);
-  const [locationError, setLocationError] = useState<string | null>(null);
-  const [locationLoading, setLocationLoading] = useState(true);
-  const [locationStatusMessage, setLocationStatusMessage] = useState("📍 Getting your location...");
-  const [locationHint, setLocationHint] = useState<string | null>(null);
-  const [locationPermissionState, setLocationPermissionState] =
-    useState<GeolocationPermissionState>("unknown");
-  const [locationSource, setLocationSource] = useState<"gps" | "approximate" | "fallback" | null>(null);
-  const [approximateLocationLabel, setApproximateLocationLabel] = useState<string | null>(null);
-  const [retryCount, setRetryCount] = useState(0);
-  const [usingFallbackLocation, setUsingFallbackLocation] = useState(false);
-  const [requestingLocationAccess, setRequestingLocationAccess] = useState(false);
+  const [plannerError, setPlannerError] = useState<string | null>(null);
   const [plannerMinimized, setPlannerMinimized] = useState(false);
   const [viewport, setViewport] = useState<MapViewport>(DEFAULT_VIEWPORT);
   const [mapInstance, setMapInstance] = useState<MapRef | null>(null);
@@ -285,76 +321,52 @@ export default function ConvoyMap() {
     properties: SpeedPointProperties;
   } | null>(null);
   const quickDestinationSuggestions = useMemo(() => getQuickDestinationSuggestions(6), []);
-  const isMobileDevice = useMemo(() => isLikelyMobileDevice(), []);
-  const requiresHttps = useMemo(() => {
-    if (typeof window === "undefined") return false;
-    return window.location.protocol !== "https:" && !isLocalhost(window.location.hostname);
-  }, []);
-  const defaultLocationHint = isMobileDevice ? MOBILE_GPS_HINT : DESKTOP_GPS_HINT;
+  const {
+    fix: myLocation, stale, attempt: retryCount, permission: locationPermissionState,
+    error: gpsError, environmentError, retry: retryLocation,
+  } = useConvoyPosition(Boolean(id && user));
+  const liveFix = stale || !isRoutingFix(myLocation) ? null : myLocation;
+  const gpsOutline = useMemo(() => myLocation ? accuracyOutline(myLocation) : [], [myLocation]);
+  const destInput = destinationDraft ?? destination?.name ?? convoy?.destination_address ?? "";
+  const { suggestions: originSuggestions, searching: searchingOrigin, failed: originSearchFailed } =
+    useConvoyPlaceSearch(originInput, originMode === "manual" && !manualOrigin && !pinTarget);
+  const { suggestions: destSuggestions, searching: searchingDest, failed: destinationSearchFailed } =
+    useConvoyPlaceSearch(destInput, !selectedDestination && destinationDraft !== null && !pinTarget);
 
-  const watchIdRef = useRef<number | null>(null);
-  const retryTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const locationIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const prevLocationRef = useRef<Coordinate | null>(null);
   const hasCenteredOnUserRef = useRef(false);
-  const skipOriginSearchRef = useRef(false);
-  const skipDestinationSearchRef = useRef(false);
-  const retryCountRef = useRef(0);
-  const usingFallbackLocationRef = useRef(false);
-  const forceRecenterOnNextFixRef = useRef(false);
-  const requestPreciseLocationRef =
-    useRef<(attemptNumber: number, options?: TrackingStartOptions) => void>(() => {});
-  const startLocationTrackingRef = useRef<(options?: TrackingStartOptions) => void>(() => {});
-  const preciseLocationResolvedRef = useRef(false);
-  const latestPositionRef = useRef<{
-    lat: number;
-    lng: number;
-    speed: number;
-    heading: number;
-  } | null>(null);
+  const localDestinationRef = useRef(false);
+  const convoyRequestRef = useRef(0);
 
   const selectedRoute = routeOptions[selectedRouteIndex] ?? null;
-  const routeCoords = selectedRoute?.coordinates ?? [];
-  const routeMode = selectedRoute?.mode ?? null;
   const routeInfo = selectedRoute
     ? {
         distanceKm: selectedRoute.distance / 1000,
-        durationMin: selectedRoute.duration / 60,
+        durationMin: selectedRoute.mode === "routed" ? selectedRoute.duration / 60 : null,
       }
     : null;
-  const routeOriginLabel =
-    originMode === "live"
-      ? myLocation
-        ? locationSource === "approximate"
-          ? "Approximate location"
-          : locationSource === "fallback"
-            ? "Mindanao fallback"
-            : "My location"
-        : usingFallbackLocation
-          ? "Approximate location"
-          : "Locating..."
-      : manualOrigin?.name || originInput.trim() || "Custom start";
-  const routeDestinationLabel = destination?.name || destInput.trim() || "No destination";
-  const liveOriginWaitingMessage = requiresHttps
-    ? "Geolocation requires HTTPS. Open the app securely or set a custom starting point."
-    : locationPermissionState === "denied"
-      ? "Please enable location access or set a custom starting point."
-      : locationSource === "approximate"
-        ? `Using an approximate location${approximateLocationLabel ? ` near ${approximateLocationLabel}` : ""} while we keep looking for your GPS. You can also set a custom starting point.`
-        : locationSource === "fallback"
-          ? "Using Davao City as a temporary Mindanao fallback while we keep trying to locate you."
-      : "Looking for your live location. Keep the map open or choose a custom starting point.";
+  const routeOriginLabel = originMode === "live" ? liveFix ? "My location" : "Locating..."
+    : manualOrigin?.name || originInput.trim() || "Custom start";
+  const routeDestinationLabel = destination?.name || "No destination";
+  const locationError = environmentError ?? (gpsError === null ? null : getGeolocationErrorMessage({ code: gpsError }));
+  const locationLoading = !myLocation && !environmentError && locationPermissionState !== "denied";
+  const locationStatusMessage = liveFix ? "Location locked"
+    : locationPermissionState === "denied" ? "Location access needed"
+    : environmentError ? "Location unavailable"
+    : stale ? "Last known location"
+    : myLocation ? "Improving accuracy..."
+    : gpsError !== null ? "Weak signal, retrying..."
+    : "Getting precise location...";
+  const liveOriginWaitingMessage = locationError
+    ? `${locationError} You can also pin a starting point.`
+    : "Waiting for a location accurate to 50 m or better. You can also choose or pin a starting point.";
   const locationCoordinatesLabel = myLocation
-    ? `Lat ${myLocation.lat.toFixed(5)}, Lng ${myLocation.lng.toFixed(5)}`
+    ? `Lat ${myLocation.lat.toFixed(5)}, Lng ${myLocation.lng.toFixed(5)} · Accuracy ±${Math.round(myLocation.accuracy)} m`
     : null;
-  const locationSourceLabel =
-    locationSource === "gps"
-      ? "Live GPS"
-      : locationSource === "approximate"
-        ? "Approximate Location"
-        : locationSource === "fallback"
-          ? "Fallback center"
-          : "Searching";
+  const locationSourceLabel = stale ? "Last known" : liveFix ? "Device location"
+    : myLocation ? "Low accuracy" : "Davao map view";
+  const locationHint = !liveFix && locationPermissionState !== "denied" && !environmentError
+    ? "On your phone, enable Precise Location and keep the map open while it gets a fix."
+    : null;
 
   const sortedRoutes = useMemo(
     () =>
@@ -404,7 +416,7 @@ export default function ConvoyMap() {
     const memberDistances = locations
       .map((location) => {
         const member = members.find((currentMember) => currentMember.user_id === location.user_id);
-        if (!member) return null;
+        if (!member || Date.now() - Date.parse(location.updated_at) > 30_000) return null;
 
         return {
           userId: location.user_id,
@@ -464,10 +476,6 @@ export default function ConvoyMap() {
   }, [gapAlert]);
 
   useEffect(() => {
-    setLocationHint(defaultLocationHint);
-  }, [defaultLocationHint]);
-
-  useEffect(() => {
     if (mapViewMode !== "speed") {
       setSelectedSpeedPoint(null);
     }
@@ -499,17 +507,6 @@ export default function ConvoyMap() {
     void loadConvoy();
     void loadMembers();
     void loadLocations();
-    startLocationTracking();
-
-    const retryTracking = () => {
-      if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
-      startLocationTracking();
-    };
-
-    window.addEventListener("focus", retryTracking);
-    window.addEventListener("online", retryTracking);
-    document.addEventListener("visibilitychange", retryTracking);
-
     const channel = supabase
       .channel(`convoy-map-${id}`)
       .on(
@@ -536,15 +533,7 @@ export default function ConvoyMap() {
 
     return () => {
       supabase.removeChannel(channel);
-      clearLocationRetryTimer();
-      clearLocationWatch();
-      if (locationIntervalRef.current) {
-        clearInterval(locationIntervalRef.current);
-        locationIntervalRef.current = null;
-      }
-      window.removeEventListener("focus", retryTracking);
-      window.removeEventListener("online", retryTracking);
-      document.removeEventListener("visibilitychange", retryTracking);
+      convoyRequestRef.current += 1;
     };
   }, [id, user]);
 
@@ -553,46 +542,22 @@ export default function ConvoyMap() {
   }, []);
 
   const loadConvoy = async () => {
+    const request = ++convoyRequestRef.current;
     const { data, error } = await supabase.from("convoys").select("*").eq("id", id!).single();
+    if (request !== convoyRequestRef.current) return;
     if (error) {
       toast.error(error.message || "Failed to load convoy");
       return;
     }
 
     setConvoy(data);
-
-    if (!data?.destination_address) {
-      setDestination(null);
-      return;
-    }
-
-    if (data.destination_lat && data.destination_lng) {
-      setDestination({
-        name: data.destination_address,
-        lat: data.destination_lat,
-        lng: data.destination_lng,
-      });
-      setDestInput(data.destination_address);
-      return;
-    }
-
-    const geo = await geocodeAddress(data.destination_address);
-    if (!geo) return;
-
-    setDestination({
-      name: data.destination_address,
-      lat: geo.lat,
-      lng: geo.lng,
-    });
-    setDestInput(data.destination_address);
-
-    await supabase
-      .from("convoys")
-      .update({
-        destination_lat: geo.lat,
-        destination_lng: geo.lng,
-      })
-      .eq("id", id!);
+    if (localDestinationRef.current) return;
+    const { destination_address: name, destination_lat: lat, destination_lng: lng } = data;
+    const saved = name && lat !== null && lng !== null && isValidCoordinate(lat, lng)
+      ? { name, lat, lng }
+      : null;
+    setDestination((previous) => previous?.name === saved?.name
+      && previous?.lat === saved?.lat && previous?.lng === saved?.lng ? previous : saved);
   };
 
   const loadMembers = async () => {
@@ -619,486 +584,79 @@ export default function ConvoyMap() {
     setLocations(data);
   };
 
-  const pushLocationUpdate = useCallback(async (next: {
-    lat: number;
-    lng: number;
-    speed: number;
-    heading: number;
-  }) => {
-    if (!id || !user) return;
+  const userId = user?.id;
+  const latestFix = useRef(liveFix);
+  latestFix.current = liveFix;
 
-    await supabase.from("member_locations").upsert(
-      {
-        convoy_id: id,
-        user_id: user.id,
-        lat: next.lat,
-        lng: next.lng,
-        heading: next.heading,
-        speed: next.speed,
-      },
-      { onConflict: "convoy_id,user_id" },
-    );
-  }, [id, user]);
+  useEffect(() => {
+    if (!id || !userId) return;
+    let lastPublished = 0;
+    let saving = false;
+    const controller = new AbortController();
 
-  const syncCurrentPosition = useCallback((coords: GeolocationCoordinates) => {
-    const next = {
-      lat: coords.latitude,
-      lng: coords.longitude,
-      heading: typeof coords.heading === "number" && !Number.isNaN(coords.heading) ? coords.heading : 0,
-      speed:
-        typeof coords.speed === "number" && !Number.isNaN(coords.speed) && coords.speed > 0
-          ? coords.speed * 3.6
-          : 0,
+    const publish = async () => {
+      const fix = latestFix.current;
+      if (saving || !isRoutingFix(fix) || fix.timestamp <= lastPublished || document.hidden) return;
+      saving = true;
+      try {
+        const { error } = await supabase.from("member_locations").upsert({
+          convoy_id: id,
+          user_id: userId,
+          lat: fix.lat,
+          lng: fix.lng,
+          heading: fix.heading ?? 0,
+          speed: fix.speed,
+        }, { onConflict: "convoy_id,user_id" }).abortSignal(controller.signal);
+        if (error) throw error;
+        lastPublished = fix.timestamp;
+      } catch (error) {
+        if (!controller.signal.aborted) console.warn("Failed to sync member location:", error);
+      } finally {
+        saving = false;
+      }
     };
 
-    const shouldRecenter =
-      forceRecenterOnNextFixRef.current ||
-      !hasCenteredOnUserRef.current ||
-      usingFallbackLocationRef.current;
+    const interval = window.setInterval(() => void publish(), 3000);
+    return () => {
+      clearInterval(interval);
+      controller.abort();
+    };
+  }, [id, userId]);
 
-    console.log("Geolocation success:", {
-      lat: next.lat,
-      lng: next.lng,
-      accuracy: coords.accuracy,
-      speed: next.speed,
-      heading: next.heading,
-    });
-
-    latestPositionRef.current = next;
-    preciseLocationResolvedRef.current = true;
-    setMyLocation({ lat: next.lat, lng: next.lng });
-    setLocationLoading(false);
-    setLocationError(null);
-    setLocationStatusMessage("✅ Location acquired");
-    setLocationHint(isMobileDevice ? "Live GPS connected." : DESKTOP_GPS_HINT);
-    setLocationPermissionState("granted");
-    setLocationSource("gps");
-    setApproximateLocationLabel(null);
-    setRetryCount(0);
-    retryCountRef.current = 0;
-    setRequestingLocationAccess(false);
-    usingFallbackLocationRef.current = false;
-    setUsingFallbackLocation(false);
-    saveLastKnownLocation({
-      lat: next.lat,
-      lng: next.lng,
-      heading: next.heading,
-      speed: next.speed,
-      updatedAt: Date.now(),
-    });
-
-    if (shouldRecenter) {
-      hasCenteredOnUserRef.current = true;
+  const centerOnFix = useCallback((fix: Coordinate) => {
+    if (mapInstance) {
+      mapInstance.easeTo({ center: [fix.lng, fix.lat], zoom: Math.max(mapInstance.getZoom(), 15), duration: 800 });
+    } else {
       setViewport((current) => ({
         ...current,
-        center: [next.lng, next.lat],
-        zoom: Math.max(current.zoom, 14),
-      }));
-    }
-    forceRecenterOnNextFixRef.current = false;
-    void pushLocationUpdate(next).catch((error) => {
-      console.warn("Failed to sync member location:", error);
-    });
-  }, [isMobileDevice, pushLocationUpdate]);
-
-  const resolveSuggestionCoordinates = async (suggestion: DestinationSuggestion) => {
-    if (typeof suggestion.lat === "number" && typeof suggestion.lon === "number") {
-      return { lat: suggestion.lat, lng: suggestion.lon };
-    }
-
-    return geocodeAddress(suggestion.display_name);
-  };
-
-  const resetRouteSelection = () => {
-    setRouteOptions([]);
-    setSelectedRouteIndex(0);
-    setRouteError(null);
-  };
-
-  const focusRouteIn3D = useCallback(
-    (origin?: Coordinate | null, target?: Coordinate | null) => {
-      const activeOrigin = origin ?? routeOrigin ?? manualOrigin ?? myLocation;
-      if (!activeOrigin || !mapInstance) return;
-
-      const activeTarget = target ?? destination;
-      const nextBearing = activeTarget
-        ? getBearingDegrees(activeOrigin, activeTarget)
-        : mapInstance.getBearing();
-
-      setCameraLocked(true);
-      mapInstance.easeTo({
-        center: [activeOrigin.lng, activeOrigin.lat],
-        zoom: Math.max(mapInstance.getZoom(), activeTarget ? 16 : 15),
-        pitch: 65,
-        bearing: nextBearing,
-        duration: 1200,
-      });
-    },
-    [destination, manualOrigin, mapInstance, myLocation, routeOrigin],
-  );
-
-  const clearLocationRetryTimer = useCallback(() => {
-    if (retryTimeoutRef.current) {
-      clearTimeout(retryTimeoutRef.current);
-      retryTimeoutRef.current = null;
-    }
-  }, []);
-
-  const clearLocationWatch = useCallback(() => {
-    if (
-      typeof navigator !== "undefined" &&
-      "geolocation" in navigator &&
-      watchIdRef.current !== null
-    ) {
-      navigator.geolocation.clearWatch(watchIdRef.current);
-      watchIdRef.current = null;
-    }
-  }, []);
-
-  const clearLocationKeepAlive = useCallback(() => {
-    if (locationIntervalRef.current) {
-      clearInterval(locationIntervalRef.current);
-      locationIntervalRef.current = null;
-    }
-  }, []);
-
-  // If precise GPS is still unavailable after several attempts, fall back to an
-  // approximate network-based location so the map stays usable.
-  const applyFallbackLocation = useCallback((hint?: string) => {
-    const shouldMoveToFallback = !preciseLocationResolvedRef.current;
-
-    usingFallbackLocationRef.current = true;
-    setUsingFallbackLocation(true);
-    setLocationSource("fallback");
-    setApproximateLocationLabel("Davao City, Mindanao");
-    setLocationLoading(false);
-    setLocationStatusMessage("⚠️ Using fallback location");
-    setLocationHint(
-      hint ?? "Showing Davao City for now while we keep trying to get your live location.",
-    );
-
-    if (shouldMoveToFallback) {
-      setMyLocation(FALLBACK_LOCATION);
-      setViewport((current) => ({
-        ...current,
-        center: [FALLBACK_LOCATION.lng, FALLBACK_LOCATION.lat],
-        zoom: Math.max(current.zoom, 12),
-      }));
-    }
-  }, []);
-
-  const applyApproximateLocation = useCallback((location: ApproximateLocation, hint?: string) => {
-    const label = [location.city, location.region, location.country]
-      .filter(Boolean)
-      .join(", ");
-    const shouldMoveToApproximate = !preciseLocationResolvedRef.current;
-
-    console.log("Approximate location fallback:", {
-      lat: location.lat,
-      lng: location.lng,
-      label,
-      source: location.source,
-    });
-
-    usingFallbackLocationRef.current = true;
-    setUsingFallbackLocation(true);
-    setLocationSource("approximate");
-    setApproximateLocationLabel(label || "your network area");
-    setLocationLoading(false);
-    setLocationError((current) =>
-      locationPermissionState === "denied" ? current ?? "Please enable location access" : null,
-    );
-    setLocationStatusMessage("⚠️ Using Approximate Location");
-    setLocationHint(
-      hint ??
-        `Based on your network${label ? ` near ${label}` : ""}. We're still trying to get your precise GPS location.`,
-    );
-
-    if (shouldMoveToApproximate) {
-      setMyLocation({ lat: location.lat, lng: location.lng });
-      setViewport((current) => ({
-        ...current,
-        center: [location.lng, location.lat],
-        zoom: Math.max(current.zoom, 12),
-      }));
-    }
-  }, [locationPermissionState]);
-
-  const applyApproximateFallback = useCallback(async (hint?: string) => {
-    if (preciseLocationResolvedRef.current) return;
-
-    const approximateLocation = await fetchApproximateLocation();
-
-    if (approximateLocation) {
-      applyApproximateLocation(approximateLocation, hint);
-      return;
-    }
-
-    applyFallbackLocation(hint);
-  }, [applyApproximateLocation, applyFallbackLocation]);
-
-  const scheduleLocationRetry = useCallback((attemptNumber: number, options: TrackingStartOptions = {}) => {
-    clearLocationRetryTimer();
-    console.log(`Geolocation retry ${attemptNumber} scheduled in ${GEOLOCATION_RETRY_DELAY_MS}ms`);
-    retryTimeoutRef.current = setTimeout(() => {
-      requestPreciseLocationRef.current(attemptNumber, options);
-    }, GEOLOCATION_RETRY_DELAY_MS);
-  }, [clearLocationRetryTimer]);
-
-  const ensureLocationWatch = useCallback((options: TrackingStartOptions = {}) => {
-    if (typeof navigator === "undefined" || !("geolocation" in navigator) || watchIdRef.current !== null) {
-      return;
-    }
-
-    watchIdRef.current = navigator.geolocation.watchPosition(
-      (position) => {
-        clearLocationRetryTimer();
-        syncCurrentPosition(position.coords);
-      },
-      (error) => {
-        console.warn("Geolocation watch error:", {
-          code: error.code,
-          message: error.message,
-        });
-
-        setRequestingLocationAccess(false);
-
-        if (error.code === GEOLOCATION_PERMISSION_DENIED) {
-          setLocationPermissionState("denied");
-          clearLocationRetryTimer();
-          clearLocationWatch();
-          setLocationLoading(false);
-          setLocationError("Please enable location access");
-          setLocationStatusMessage("⚠️ Location access needed");
-          setLocationHint(
-            "Open your browser or device settings, allow location access, then tap Retry Location.",
-          );
-          void applyApproximateFallback(
-            "Location access is off. Showing an approximate location until GPS permission is enabled.",
-          );
-          return;
-        }
-
-        if (!preciseLocationResolvedRef.current) {
-          setLocationError(getTrackingLocationErrorMessage(error.code));
-          setLocationStatusMessage("📡 Weak signal, retrying...");
-          setLocationHint(defaultLocationHint);
-          if (!retryTimeoutRef.current && retryCountRef.current < GEOLOCATION_MAX_RETRIES) {
-            scheduleLocationRetry(retryCountRef.current + 1, options);
-          }
-          return;
-        }
-
-        setLocationLoading(true);
-        setLocationError(getTrackingLocationErrorMessage(error.code));
-        setLocationStatusMessage("📡 Weak signal, retrying...");
-        setLocationHint("Signal dropped. Keep the screen open while we reconnect to GPS.");
-
-        if (!retryTimeoutRef.current) {
-          retryCountRef.current = 0;
-          setRetryCount(0);
-          scheduleLocationRetry(1, options);
-        }
-      },
-      WATCH_POSITION_OPTIONS,
-    );
-  }, [
-    applyApproximateFallback,
-    clearLocationRetryTimer,
-    clearLocationWatch,
-    defaultLocationHint,
-    scheduleLocationRetry,
-    syncCurrentPosition,
-  ]);
-
-  const requestPreciseLocation = useCallback((attemptNumber: number, options: TrackingStartOptions = {}) => {
-    if (typeof navigator === "undefined" || !("geolocation" in navigator)) {
-      return;
-    }
-
-    console.log(`Geolocation retry attempt ${attemptNumber} of ${GEOLOCATION_MAX_RETRIES}`);
-    setLocationLoading(true);
-    setLocationStatusMessage(
-      attemptNumber > 1 ? "📡 Weak signal, retrying..." : "📍 Getting your location...",
-    );
-
-    navigator.geolocation.getCurrentPosition(
-      (position) => {
-        clearLocationRetryTimer();
-        syncCurrentPosition(position.coords);
-        ensureLocationWatch(options);
-      },
-      (error) => {
-        console.warn("Geolocation request error:", {
-          attempt: attemptNumber,
-          code: error.code,
-          message: error.message,
-        });
-
-        setRequestingLocationAccess(false);
-
-        if (error.code === GEOLOCATION_PERMISSION_DENIED) {
-          setLocationPermissionState("denied");
-          clearLocationRetryTimer();
-          clearLocationWatch();
-          setLocationLoading(false);
-          setLocationError("Please enable location access");
-          setLocationStatusMessage("⚠️ Location access needed");
-          setLocationHint(
-            "Open your browser or device settings, allow location access, then tap Retry Location.",
-          );
-          void applyApproximateFallback(
-            "Location permission is denied. Showing an approximate location until access is enabled.",
-          );
-          return;
-        }
-
-        retryCountRef.current = attemptNumber;
-        setRetryCount(attemptNumber);
-        setLocationError(getTrackingLocationErrorMessage(error.code));
-        setLocationHint(defaultLocationHint);
-
-        if (attemptNumber < GEOLOCATION_MAX_RETRIES) {
-          setLocationStatusMessage("📡 Weak signal, retrying...");
-          scheduleLocationRetry(attemptNumber + 1, options);
-          return;
-        }
-
-        setLocationLoading(false);
-        void applyApproximateFallback(
-          "We couldn't get a precise GPS fix yet. Showing an approximate location while GPS keeps trying in the background.",
-        );
-      },
-      INITIAL_POSITION_OPTIONS,
-    );
-  }, [
-    applyApproximateFallback,
-    clearLocationRetryTimer,
-    clearLocationWatch,
-    defaultLocationHint,
-    ensureLocationWatch,
-    scheduleLocationRetry,
-    syncCurrentPosition,
-  ]);
-
-  requestPreciseLocationRef.current = requestPreciseLocation;
-
-  const startLocationTracking = useCallback((options: TrackingStartOptions = {}) => {
-    forceRecenterOnNextFixRef.current = Boolean(options.forceRecenter);
-
-    if (options.manual) {
-      setPlannerMinimized(false);
-      setRequestingLocationAccess(true);
-      setLocationError(null);
-    }
-
-    if (requiresHttps) {
-      console.warn("Geolocation error:", { code: "https", message: "Geolocation requires HTTPS" });
-      clearLocationRetryTimer();
-      clearLocationWatch();
-      clearLocationKeepAlive();
-      setLocationPermissionState("unknown");
-      setLocationLoading(false);
-      setLocationError("Geolocation requires HTTPS");
-      setLocationStatusMessage("⚠️ Location unavailable");
-      setRequestingLocationAccess(false);
-      void applyApproximateFallback(
-        "Geolocation requires HTTPS. Showing an approximate location until the app is opened securely.",
-      );
-      return;
-    }
-
-    if (typeof navigator === "undefined" || !("geolocation" in navigator)) {
-      const message = getGeolocationUnsupportedMessage("tracking");
-      console.warn("Geolocation error:", { code: "unsupported", message });
-      clearLocationRetryTimer();
-      clearLocationWatch();
-      clearLocationKeepAlive();
-      setLocationPermissionState("unsupported");
-      setLocationLoading(false);
-      setLocationError(message);
-      setLocationStatusMessage("⚠️ Location unavailable");
-      setRequestingLocationAccess(false);
-      void applyApproximateFallback(
-        "This device does not support precise browser geolocation. Showing an approximate location instead.",
-      );
-      return;
-    }
-
-    clearLocationRetryTimer();
-    setLocationLoading(true);
-    setLocationStatusMessage("📍 Getting your location...");
-    setLocationHint(defaultLocationHint);
-
-    void (async () => {
-      const permissionState = await getLocationPermissionState();
-      setLocationPermissionState(permissionState);
-
-      if (permissionState === "denied") {
-        setLocationLoading(false);
-        setLocationError("Please enable location access");
-        setLocationStatusMessage("⚠️ Location access needed");
-        setLocationHint(
-          "Open your browser or device settings, allow location access, then tap Retry Location.",
-        );
-        setRequestingLocationAccess(false);
-        clearLocationWatch();
-        void applyApproximateFallback(
-          "Location access is disabled. Showing an approximate location until permission is enabled.",
-        );
-        return;
-      }
-
-      ensureLocationWatch(options);
-      requestPreciseLocationRef.current(1, options);
-
-      if (!locationIntervalRef.current) {
-        locationIntervalRef.current = setInterval(() => {
-          if (!latestPositionRef.current) return;
-          void pushLocationUpdate(latestPositionRef.current).catch((error) => {
-            console.warn("Failed to keep location alive:", error);
-          });
-        }, 5000);
-      }
-    })();
-  }, [
-    applyApproximateFallback,
-    clearLocationKeepAlive,
-    clearLocationRetryTimer,
-    clearLocationWatch,
-    defaultLocationHint,
-    ensureLocationWatch,
-    pushLocationUpdate,
-    requiresHttps,
-  ]);
-
-  startLocationTrackingRef.current = startLocationTracking;
-
-  const handleRetryLocationAccess = () => {
-    retryCountRef.current = 0;
-    setRetryCount(0);
-    setRouteError(null);
-    setLocationStatusMessage("📍 Getting your location...");
-    startLocationTracking({ manual: true });
-  };
-
-  const handleUseMyLocationAgain = () => {
-    setCameraLocked(false);
-    setRouteError(null);
-    retryCountRef.current = 0;
-    setRetryCount(0);
-    setLocationStatusMessage("📍 Getting your location...");
-
-    if (myLocation) {
-      hasCenteredOnUserRef.current = true;
-      setViewport((current) => ({
-        ...current,
-        center: [myLocation.lng, myLocation.lat],
+        center: [fix.lng, fix.lat],
         zoom: Math.max(current.zoom, 15),
       }));
     }
+  }, [mapInstance]);
 
-    startLocationTracking({ manual: true, forceRecenter: true });
+  useEffect(() => {
+    if (!liveFix || hasCenteredOnUserRef.current || cameraLocked || pinTarget
+      || manualOrigin || destination) return;
+    hasCenteredOnUserRef.current = true;
+    centerOnFix(liveFix);
+  }, [cameraLocked, centerOnFix, destination, liveFix, manualOrigin, pinTarget]);
+
+  const handleRetryLocationAccess = () => {
+    if (liveFix) centerOnFix(liveFix);
+    else retryLocation.current();
+  };
+
+  const focusRouteIn3D = (origin: Coordinate | null, target: Coordinate | null) => {
+    if (!origin || !mapInstance) return;
+    setCameraLocked(true);
+    mapInstance.easeTo({
+      center: [origin.lng, origin.lat],
+      zoom: Math.max(mapInstance.getZoom(), target ? 16 : 15),
+      pitch: 60,
+      bearing: target ? getBearingDegrees(origin, target) : mapInstance.getBearing(),
+      duration: 1200,
+    });
   };
 
   const getMemberColor = (role: string) => {
@@ -1121,500 +679,217 @@ export default function ConvoyMap() {
   const getMemberPinLabel = (member: MemberWithProfile) =>
     member.profiles?.display_name?.trim().charAt(0).toUpperCase() || member.role.charAt(0).toUpperCase();
 
-  const buildFallbackRoute = useCallback(() => {
-    const origin = routeOrigin || myLocation;
-    if (!destination || !origin) return;
+  const plannedOrigin = originMode === "manual" ? manualOrigin : liveFix;
+  useEffect(() => {
+    setRouteOrigin((previous) => {
+      if (!plannedOrigin || originMode === "manual" || !previous) return plannedOrigin;
+      const distance = haversineMeters(previous, plannedOrigin);
+      return distance >= REROUTE_THRESHOLD_METERS ? plannedOrigin : previous;
+    });
+  }, [originMode, plannedOrigin]);
 
-    const distance = haversineMeters(origin, destination);
-    const duration = distance > 0 ? (distance / 1000 / 35) * 3600 : 0;
-    setRouteOptions([
-      {
-        coordinates: [
-          [origin.lng, origin.lat],
-          [destination.lng, destination.lat],
-        ],
-        distance,
-        duration,
-        mode: "direct",
-      },
-    ]);
+  useEffect(() => {
+    setRouteOptions([]);
     setSelectedRouteIndex(0);
-    setRouteError("Turn-by-turn routing is unavailable right now. Showing a direct path instead.");
-  }, [destination, myLocation, routeOrigin]);
-
-  useEffect(() => {
-    if (!destination || !myLocation) {
-      prevLocationRef.current = null;
-      if (!destination) {
-        setRouteOrigin(originMode === "manual" ? manualOrigin : myLocation);
-        setRouteOptions([]);
-        setSelectedRouteIndex(0);
-        setIsLoadingRoutes(false);
-        setRouteError(null);
-        return;
-      }
-
-      if (originMode === "manual" && manualOrigin) {
-        setRouteOrigin(manualOrigin);
-        setIsLoadingRoutes(false);
-        setRouteError(null);
-        return;
-      }
-
-      setRouteOrigin(null);
-      setRouteOptions([]);
-      setSelectedRouteIndex(0);
-      setIsLoadingRoutes(false);
-      setRouteError(liveOriginWaitingMessage);
-      return;
-    }
-
-    if (originMode === "manual") {
-      prevLocationRef.current = null;
-      if (manualOrigin) {
-        setRouteOrigin(manualOrigin);
-        setRouteError(null);
-      } else {
-        setRouteOrigin(null);
-        setRouteOptions([]);
-        setSelectedRouteIndex(0);
-        setIsLoadingRoutes(false);
-        setRouteError("Search for a starting point or switch back to your live location.");
-      }
-      return;
-    }
-
-    const previousLocation = prevLocationRef.current;
-    const distanceMoved = previousLocation ? haversineMeters(previousLocation, myLocation) : Infinity;
-
-    if (!previousLocation || distanceMoved > REROUTE_THRESHOLD_METERS) {
-      prevLocationRef.current = myLocation;
-      setRouteOrigin(myLocation);
-      setRouteError(null);
-    }
-  }, [destination, liveOriginWaitingMessage, manualOrigin, myLocation, originMode]);
-
-  useEffect(() => {
+    setRouteError(null);
     if (!destination || !routeOrigin) {
-      setRouteOptions([]);
-      setSelectedRouteIndex(0);
       setIsLoadingRoutes(false);
       return;
     }
 
     const controller = new AbortController();
-
+    const timeout = window.setTimeout(() => controller.abort("timeout"), 12_000);
     const fetchRoute = async () => {
       setIsLoadingRoutes(true);
+      let failureMessage = "Driving directions are unavailable. Showing straight-line distance.";
       try {
-        const url = `https://router.project-osrm.org/route/v1/driving/${routeOrigin.lng},${routeOrigin.lat};${destination.lng},${destination.lat}?overview=full&geometries=geojson&alternatives=true`;
+        const endpoints = `${routeOrigin.lng},${routeOrigin.lat};${destination.lng},${destination.lat}`;
+        const url = `https://router.project-osrm.org/route/v1/driving/${endpoints}?overview=full&geometries=geojson&alternatives=true&radiuses=150;150`;
         const response = await fetch(url, { signal: controller.signal });
-        if (!response.ok) {
-          throw new Error(`Routing request failed with ${response.status}`);
+        const json = await response.json() as {
+          code?: string;
+          waypoints?: { distance: number }[];
+          routes?: { geometry: { coordinates: RouteCoordinate[] }; distance: number; duration: number }[];
+        };
+        if (controller.signal.aborted) return;
+        if (json.code === "NoSegment" || json.code === "NoRoute") {
+          failureMessage = "No driving route connects these pins. Try placing the start or destination near a road entrance.";
         }
+        if (!response.ok || json.code !== "Ok" || !json.routes?.length) throw new Error(failureMessage);
 
-        const json = await response.json();
-        const routes = (json?.routes || []) as Array<{
-          geometry: { coordinates: RouteCoordinate[] };
-          distance: number;
-          duration: number;
-        }>;
-        if (routes.length === 0) {
-          throw new Error("No route found");
+        setRouteOptions(json.routes.map((route) => ({
+          coordinates: route.geometry.coordinates,
+          distance: route.distance,
+          duration: route.duration,
+          mode: "routed",
+        })));
+        if (json.waypoints?.some(({ distance }) => distance > 40)) {
+          setRouteError("The driving route starts or ends at a nearby road. Check the pin and use the entrance for a closer match.");
         }
-
-        setRouteOptions(
-          routes.map((route) => ({
-            coordinates: route.geometry.coordinates,
-            distance: route.distance,
-            duration: route.duration,
-            mode: "routed" as const,
-          })),
-        );
-        setSelectedRouteIndex(0);
-        setRouteError(null);
-      } catch (error) {
-        if (!controller.signal.aborted) {
-          buildFallbackRoute();
-        }
+      } catch {
+        if (controller.signal.aborted && controller.signal.reason !== "timeout") return;
+        setRouteOptions([{
+          coordinates: [[routeOrigin.lng, routeOrigin.lat], [destination.lng, destination.lat]],
+          distance: haversineMeters(routeOrigin, destination),
+          duration: 0,
+          mode: "direct",
+        }]);
+        setRouteError(failureMessage);
       } finally {
-        if (!controller.signal.aborted) {
-          setIsLoadingRoutes(false);
-        }
+        clearTimeout(timeout);
+        if (!controller.signal.aborted || controller.signal.reason === "timeout") setIsLoadingRoutes(false);
       }
     };
 
     void fetchRoute();
-    return () => controller.abort();
-  }, [buildFallbackRoute, destination, routeOrigin]);
-
-  useEffect(() => {
-    if (selectedRouteIndex < routeOptions.length) return;
-    setSelectedRouteIndex(0);
-  }, [routeOptions, selectedRouteIndex]);
-
-  useEffect(() => {
-    if (!routeInfo) return;
-    if (routeInfo.distanceKm >= 5) {
-      toast.warning(`Destination is ${routeInfo.distanceKm.toFixed(1)} km away`, { duration: 4000 });
-    }
-  }, [routeInfo]);
-
-  useEffect(() => {
-    if (skipOriginSearchRef.current) {
-      skipOriginSearchRef.current = false;
-      setOriginSuggestions([]);
-      setSearchingOrigin(false);
-      return;
-    }
-
-    if (originMode === "live" || !originInput.trim()) {
-      setOriginSuggestions([]);
-      setSearchingOrigin(false);
-      return;
-    }
-
-    const curatedSuggestions = getCuratedDestinationSuggestions(originInput, 6);
-    const controller = new AbortController();
-    const timer = setTimeout(async () => {
-      setSearchingOrigin(true);
-      try {
-        const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(originInput)}&format=json&limit=5`;
-        const response = await fetch(url, {
-          headers: { "Accept-Language": "en", "User-Agent": "ConvoyApp/1.0" },
-          signal: controller.signal,
-        });
-        const json = await response.json();
-        const remoteSuggestions = (json || []).map((result: { display_name: string; lat: string; lon: string }) => ({
-          display_name: result.display_name,
-          lat: parseFloat(result.lat),
-          lon: parseFloat(result.lon),
-          source: "search" as const,
-        }));
-        setOriginSuggestions(
-          mergeDestinationSuggestions(curatedSuggestions, remoteSuggestions, 8),
-        );
-      } catch (error) {
-        if (!controller.signal.aborted) {
-          setOriginSuggestions(curatedSuggestions);
-        }
-      } finally {
-        setSearchingOrigin(false);
-      }
-    }, 250);
-
     return () => {
-      clearTimeout(timer);
+      clearTimeout(timeout);
       controller.abort();
     };
-  }, [originInput, originMode]);
+  }, [destination, routeOrigin]);
+
+  const handleSelectOrigin = useCallback((suggestion: DestinationSuggestion) => {
+    const { lat, lon, display_name: name } = suggestion;
+    if (lat === undefined || lon === undefined || !isValidCoordinate(lat, lon)) return;
+    setOriginMode("manual");
+    setOriginInput(name);
+    setManualOrigin({ name, lat, lng: lon });
+    setPlannerError(null);
+  }, []);
+
+  const handleSelectDestination = useCallback((suggestion: DestinationSuggestion) => {
+    const { lat, lon, display_name: name } = suggestion;
+    if (lat === undefined || lon === undefined || !isValidCoordinate(lat, lon)) return;
+    setDestinationDraft(name);
+    setSelectedDestination({ name, lat, lng: lon });
+    setPlannerError(null);
+  }, []);
+
+  const handlePickPin = (target: "from" | "to") => {
+    setPinTarget(target);
+    setPlannerError(null);
+    setCameraLocked(true);
+  };
 
   useEffect(() => {
-    if (skipDestinationSearchRef.current) {
-      skipDestinationSearchRef.current = false;
-      setDestSuggestions([]);
-      setSearchingDest(false);
-      return;
-    }
-
-    if (!destInput.trim()) {
-      setDestSuggestions([]);
-      setSearchingDest(false);
-      return;
-    }
-
-    const curatedSuggestions = getCuratedDestinationSuggestions(destInput, 6);
-    const controller = new AbortController();
-    const timer = setTimeout(async () => {
-      setSearchingDest(true);
-      try {
-        const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(destInput)}&format=json&limit=5`;
-        const response = await fetch(url, {
-          headers: { "Accept-Language": "en", "User-Agent": "ConvoyApp/1.0" },
-          signal: controller.signal,
-        });
-        const json = await response.json();
-        const remoteSuggestions = (json || []).map((result: { display_name: string; lat: string; lon: string }) => ({
-            display_name: result.display_name,
-            lat: parseFloat(result.lat),
-            lon: parseFloat(result.lon),
-            source: "search" as const,
-          }));
-        setDestSuggestions(
-          mergeDestinationSuggestions(curatedSuggestions, remoteSuggestions, 8),
-        );
-      } catch (error) {
-        if (!controller.signal.aborted) {
-          setDestSuggestions(curatedSuggestions);
-        }
-      } finally {
-        setSearchingDest(false);
-      }
-    }, 250);
-
+    if (!mapInstance || !pinTarget) return;
+    const canvas = mapInstance.getCanvas();
+    const previousCursor = canvas.style.cursor;
+    canvas.style.cursor = "crosshair";
+    const handleClick = ({ lngLat }: { lngLat: { lat: number; lng: number } }) => {
+      const lng = ((lngLat.lng + 180) % 360 + 360) % 360 - 180;
+      const coordinate = coordinateSuggestion(lngLat.lat, lng);
+      if (pinTarget === "from") handleSelectOrigin(coordinate);
+      else handleSelectDestination(coordinate);
+      setPinTarget(null);
+    };
+    mapInstance.on("click", handleClick);
     return () => {
-      clearTimeout(timer);
-      controller.abort();
+      canvas.style.cursor = previousCursor;
+      mapInstance.off("click", handleClick);
     };
-  }, [destInput]);
-
-  const geocodeAddress = async (address: string): Promise<Coordinate | null> => {
-    try {
-      const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(address)}&format=json&limit=1`;
-      const response = await fetch(url, {
-        headers: { "Accept-Language": "en", "User-Agent": "ConvoyApp/1.0" },
-      });
-      const json = await response.json();
-      const hit = json?.[0];
-      if (!hit) return null;
-
-      return {
-        lat: parseFloat(hit.lat),
-        lng: parseFloat(hit.lon),
-      };
-    } catch (error) {
-      return null;
-    }
-  };
-
-  const persistDestination = async (next: { name: string; lat: number; lng: number }) => {
-    const { error } = await supabase
-      .from("convoys")
-      .update({
-        destination_address: next.name,
-        destination_lat: next.lat,
-        destination_lng: next.lng,
-      })
-      .eq("id", id!);
-
-    if (error) {
-      toast.error(error.message || "Failed to save destination");
-    }
-  };
-
-  const handleSelectDestination = async (suggestion: DestinationSuggestion) => {
-    skipDestinationSearchRef.current = true;
-    const resolvedCoords = await resolveSuggestionCoordinates(suggestion);
-
-    if (!resolvedCoords) {
-      toast.error("We couldn't find that destination yet. Try a more specific place name.");
-      return null;
-    }
-
-    const nextDestination = {
-      name: suggestion.display_name,
-      lat: resolvedCoords.lat,
-      lng: resolvedCoords.lng,
-    };
-
-    setDestInput(suggestion.display_name);
-    setDestSuggestions([]);
-    setDestination(nextDestination);
-    setViewport((current) => ({
-      ...current,
-      center: [resolvedCoords.lng, resolvedCoords.lat],
-      zoom: Math.max(current.zoom, 12),
-    }));
-    setCameraLocked(false);
-    prevLocationRef.current = null;
-    setRouteOrigin(originMode === "manual" ? manualOrigin : myLocation);
-    resetRouteSelection();
-    setIsLoadingRoutes(Boolean(originMode === "manual" ? manualOrigin : myLocation));
-    void persistDestination(nextDestination);
-    return nextDestination;
-  };
+  }, [handleSelectDestination, handleSelectOrigin, mapInstance, pinTarget]);
 
   const handleOriginInputChange = (value: string) => {
-    setPlannerMinimized(false);
     setOriginMode("manual");
     setOriginInput(value);
     setManualOrigin(null);
-    if (!value.trim()) {
-      setOriginSuggestions([]);
-      setRouteOrigin(null);
-      setIsLoadingRoutes(false);
-      setRouteError(destination ? "Search for a starting point or switch back to your live location." : null);
-    }
-  };
-
-  const handleOriginInputFocus = () => {
-    setPlannerMinimized(false);
-    if (originMode !== "live") return;
-    setOriginMode("manual");
-    setOriginInput("");
-    setManualOrigin(null);
-    setOriginSuggestions([]);
-  };
-
-  const handleSelectOrigin = async (suggestion: DestinationSuggestion) => {
-    skipOriginSearchRef.current = true;
-    const resolvedCoords = await resolveSuggestionCoordinates(suggestion);
-
-    if (!resolvedCoords) {
-      toast.error("We couldn't find that starting point yet. Try a more specific place name.");
-      return null;
-    }
-
-    const nextOrigin = {
-      name: suggestion.display_name,
-      lat: resolvedCoords.lat,
-      lng: resolvedCoords.lng,
-    };
-
-    setOriginMode("manual");
-    setOriginInput(suggestion.display_name);
-    setOriginSuggestions([]);
-    setManualOrigin(nextOrigin);
-    setRouteOrigin(nextOrigin);
-    setCameraLocked(false);
-    prevLocationRef.current = null;
-    setViewport((current) => ({
-      ...current,
-      center: [resolvedCoords.lng, resolvedCoords.lat],
-      zoom: Math.max(current.zoom, 11.5),
-    }));
-    resetRouteSelection();
-    setIsLoadingRoutes(Boolean(destination));
-    return nextOrigin;
+    setPlannerError(null);
   };
 
   const handleUseLiveOrigin = () => {
-    setPlannerMinimized(false);
-    skipOriginSearchRef.current = true;
     setOriginMode("live");
     setOriginInput(LIVE_ORIGIN_LABEL);
-    setOriginSuggestions([]);
     setManualOrigin(null);
-    prevLocationRef.current = myLocation;
-    setRouteOrigin(myLocation);
-    resetRouteSelection();
-    setIsLoadingRoutes(Boolean(destination && myLocation));
-    if (!myLocation) {
-      setRouteError(liveOriginWaitingMessage);
-      handleUseMyLocationAgain();
-    }
+    setPinTarget(null);
+    setPlannerError(null);
+    setRouteOrigin(liveFix);
+    if (liveFix) centerOnFix(liveFix);
+    else retryLocation.current();
   };
 
   const handleApplyRouteSearch = async () => {
-    const trimmedDestination = destInput.trim();
-    if (!trimmedDestination) return;
-    let activeOrigin = originMode === "manual" ? manualOrigin : myLocation;
+    const inputOrigin = originMode === "manual" ? parseCoordinateSuggestion(originInput) : null;
+    const origin = originMode === "live" ? (isRoutingFix(liveFix) ? liveFix : null)
+      : manualOrigin ?? (inputOrigin ? { lat: inputOrigin.lat, lng: inputOrigin.lon } : null);
+    const inputDestination = parseCoordinateSuggestion(destInput);
+    const target = selectedDestination ?? (destinationDraft === null ? destination : null)
+      ?? (inputDestination ? { name: inputDestination.display_name, lat: inputDestination.lat, lng: inputDestination.lon } : null);
 
-    if (originMode === "live" && !activeOrigin) {
-      setRouteError(liveOriginWaitingMessage);
-      toast.error("We’re still getting your live location. Choose a custom starting point or retry location.");
-      handleRetryLocationAccess();
+    if (!origin || !target) {
+      setPlannerError(!origin
+        ? originMode === "live" ? liveOriginWaitingMessage : "Choose a starting point from the results or pin it on the map."
+        : "Choose a destination from the results or pin it on the map.");
       return;
     }
 
-    if (originMode === "manual") {
-      const trimmedOrigin = originInput.trim();
-      if (!trimmedOrigin) {
-        toast.error("Enter a starting point or use your live location.");
+    if (convoy?.leader_id === user?.id && target !== destination) {
+      setApplyingRoute(true);
+      try {
+        const { data, error } = await supabase.from("convoys").update({
+          destination_address: target.name,
+          destination_lat: target.lat,
+          destination_lng: target.lng,
+        }).eq("id", id!).select("id").single();
+        if (error || !data) throw error ?? new Error("Destination update was not applied");
+      } catch {
+        setPlannerError("The convoy destination could not be saved. Try again.");
         return;
+      } finally {
+        setApplyingRoute(false);
       }
-
-      const originMatchesManual =
-        manualOrigin && normalizeSuggestionLabel(manualOrigin.name) === normalizeSuggestionLabel(trimmedOrigin);
-
-      if (!originMatchesManual) {
-        const originSuggestion =
-          originSuggestions.find(
-            (suggestion) =>
-              normalizeSuggestionLabel(suggestion.display_name) === normalizeSuggestionLabel(trimmedOrigin),
-          ) ?? {
-            display_name: trimmedOrigin,
-            source: "search" as const,
-          };
-
-        const originApplied = await handleSelectOrigin(originSuggestion);
-        if (!originApplied) return;
-        activeOrigin = originApplied;
-      }
+      convoyRequestRef.current += 1;
+    } else if (target !== destination) {
+      localDestinationRef.current = true;
     }
 
-    let activeDestination = destination;
-    const destinationMatchesCurrent =
-      destination && normalizeSuggestionLabel(destination.name) === normalizeSuggestionLabel(trimmedDestination);
-
-    if (!destinationMatchesCurrent) {
-      const destinationSuggestion =
-        destSuggestions.find(
-          (suggestion) =>
-            normalizeSuggestionLabel(suggestion.display_name) === normalizeSuggestionLabel(trimmedDestination),
-        ) ?? {
-          display_name: trimmedDestination,
-          source: "search" as const,
-        };
-
-      const destinationApplied = await handleSelectDestination(destinationSuggestion);
-      if (!destinationApplied) return;
-      activeDestination = destinationApplied;
-    }
-
-    if (activeOrigin && activeDestination) {
-      if (typeof document !== "undefined" && document.activeElement instanceof HTMLElement) {
-        document.activeElement.blur();
-      }
-      focusRouteIn3D(activeOrigin, activeDestination);
-      setPlannerMinimized(true);
-    }
+    if (inputOrigin && !manualOrigin) handleSelectOrigin(inputOrigin);
+    setDestination(target);
+    setDestinationDraft(null);
+    setSelectedDestination(null);
+    setPlannerError(null);
+    const currentOrigin = originMode === "live"
+      ? isRoutingFix(latestFix.current) ? latestFix.current : null
+      : origin;
+    setRouteOrigin(currentOrigin);
+    if (!currentOrigin) return;
+    if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
+    focusRouteIn3D(currentOrigin, target);
+    setPlannerMinimized(true);
   };
 
   const routeBoundsPoints = useMemo<RouteCoordinate[]>(() => {
-    if (routeCoords.length > 0) return routeCoords;
-    const activeOrigin = routeOrigin ?? manualOrigin ?? myLocation;
-
-    if (activeOrigin && destination) {
-      return [
-        [activeOrigin.lng, activeOrigin.lat],
-        [destination.lng, destination.lat],
-      ];
-    }
-    if (activeOrigin) return [[activeOrigin.lng, activeOrigin.lat]];
-    if (destination) return [[destination.lng, destination.lat]];
-    return [];
-  }, [destination, manualOrigin, myLocation, routeCoords, routeOrigin]);
+    if (!destination) return [];
+    const endpoints: RouteCoordinate[] = [[destination.lng, destination.lat]];
+    if (routeOrigin) endpoints.unshift([routeOrigin.lng, routeOrigin.lat]);
+    return selectedRoute ? [...endpoints, ...selectedRoute.coordinates] : endpoints;
+  }, [destination, routeOrigin, selectedRoute]);
 
   useEffect(() => {
-    if (!mapInstance || !mapReady) return;
-    if (cameraLocked) return;
-
-    if (routeBoundsPoints.length === 0) {
-      mapInstance.easeTo({
-        center: DEFAULT_VIEWPORT.center,
-        zoom: DEFAULT_VIEWPORT.zoom,
-        duration: 700,
-      });
-      return;
-    }
+    if (!mapInstance || !mapReady || cameraLocked || pinTarget || routeBoundsPoints.length === 0) return;
 
     if (routeBoundsPoints.length === 1) {
       mapInstance.easeTo({
         center: routeBoundsPoints[0],
-        zoom: Math.max(mapInstance.getZoom(), 14),
+        zoom: 14,
         duration: 700,
       });
       return;
     }
 
-    const bounds = routeBoundsPoints
-      .slice(1)
-      .reduce(
-        (currentBounds, coordinate) => currentBounds.extend(coordinate),
-        new LngLatBounds(routeBoundsPoints[0], routeBoundsPoints[0]),
-      );
-
+    const bounds = routeBoundsPoints.reduce(
+      (currentBounds, coordinate) => currentBounds.extend(coordinate),
+      new LngLatBounds(),
+    );
     mapInstance.fitBounds(bounds, {
       duration: 900,
       maxZoom: 15,
-      padding: { top: 140, right: 80, bottom: 120, left: 80 },
+      padding: { top: 140, right: 45, bottom: 90, left: 45 },
     });
-  }, [cameraLocked, mapInstance, mapReady, routeBoundsPoints]);
+  }, [cameraLocked, mapInstance, mapReady, pinTarget, routeBoundsPoints]);
 
-  const handle3DView = () => {
-    focusRouteIn3D();
-  };
+  const visibleDestination = selectedDestination ?? destination;
+  const handle3DView = () => focusRouteIn3D(plannedOrigin, visibleDestination);
 
   const handleResetView = () => {
     setCameraLocked(false);
@@ -1639,7 +914,7 @@ export default function ConvoyMap() {
                 <p className="max-w-[220px] truncate text-xs text-muted-foreground">
                   → {destination.name}
                 </p>
-              ) : locationError || locationLoading || usingFallbackLocation ? (
+              ) : locationError || locationLoading || !liveFix ? (
                 <p
                   className={`max-w-[220px] truncate text-[11px] ${
                     locationError ? "text-destructive" : "text-muted-foreground"
@@ -1684,13 +959,16 @@ export default function ConvoyMap() {
       <div className="relative flex-1 bg-muted">
         <AppMap
           ref={handleMapRef}
-          className="absolute inset-0"
+          className={pinTarget
+            ? "absolute inset-0 [&_.maplibregl-marker]:pointer-events-none [&_.maplibregl-popup]:pointer-events-none"
+            : "absolute inset-0"}
           center={DEFAULT_VIEWPORT.center}
           zoom={DEFAULT_VIEWPORT.zoom}
           viewport={viewport}
           onViewportChange={setViewport}
           maxPitch={60}
         >
+          {myLocation && <MapRoute coordinates={gpsOutline} color={liveFix ? "#3b82f6" : "#64748b"} width={2} opacity={0.55} interactive={false} />}
           {sortedRoutes.map(({ route, index }) => {
             const isSelected = index === selectedRouteIndex;
             const isDirect = route.mode === "direct";
@@ -1704,7 +982,9 @@ export default function ConvoyMap() {
                 width={isSelected ? 6 : 5}
                 opacity={isSelected ? 1 : 0.6}
                 dashArray={isDirect ? [2, 2] : undefined}
+                interactive={!pinTarget}
                 onClick={() => {
+                  if (pinTarget) return;
                   setCameraLocked(false);
                   setSelectedRouteIndex(index);
                 }}
@@ -1715,7 +995,7 @@ export default function ConvoyMap() {
           {mapViewMode === "members" &&
             locations.map((location) => {
               const member = getMemberForLocation(location);
-              if (!member) return null;
+              if (!member || location.user_id === userId) return null;
 
               const stale = isStale(location.updated_at);
               return (
@@ -1752,23 +1032,24 @@ export default function ConvoyMap() {
             })}
 
           {mapViewMode === "members" && myLocation && (
-            <MapMarker longitude={myLocation.lng} latitude={myLocation.lat} anchor="bottom">
+            <MapMarker longitude={myLocation.lng} latitude={myLocation.lat} anchor="center">
               <MarkerContent>
-                <div className="relative">
-                  <ConvoyMarkerPin color="hsl(var(--primary))" label="Y" pulse />
-                  <div className="absolute -top-8 left-1/2 -translate-x-1/2 rounded-full border bg-background/90 px-2 py-1 text-[10px] font-semibold shadow-sm">
-                    You
-                  </div>
-                </div>
+                <CurrentLocationMarker heading={myLocation.heading} precise={Boolean(liveFix)} />
               </MarkerContent>
               <MarkerPopup className="min-w-[170px]">
                 <div className="space-y-1">
-                  <p className="font-semibold">Your location</p>
+                  <p className="font-semibold">{stale ? "Last known location" : liveFix ? "Your location" : "Low-accuracy location"}</p>
                   <p className="text-xs text-muted-foreground">
-                    Speed: {(latestPositionRef.current?.speed ?? 0).toFixed(1)} km/h
+                    {myLocation.lat.toFixed(6)}, {myLocation.lng.toFixed(6)}
                   </p>
                   <p className="text-xs text-muted-foreground">
-                    Heading: {(latestPositionRef.current?.heading ?? 0).toFixed(0)}°
+                    Accuracy: ±{Math.round(myLocation.accuracy)} m
+                  </p>
+                  <p className="text-xs text-muted-foreground">
+                    Speed: {liveFix ? `${myLocation.speed.toFixed(1)} km/h` : "Unavailable"}
+                  </p>
+                  <p className="text-xs text-muted-foreground capitalize">
+                    Fix time: {new Date(myLocation.timestamp).toLocaleTimeString()}
                   </p>
                 </div>
               </MarkerPopup>
@@ -1834,20 +1115,18 @@ export default function ConvoyMap() {
             </MapPopup>
           )}
 
-          {destination && (
-            <MapMarker longitude={destination.lng} latitude={destination.lat} anchor="bottom">
+          {visibleDestination && (
+            <MapMarker longitude={visibleDestination.lng} latitude={visibleDestination.lat} anchor="bottom">
               <MarkerContent>
-                <div className="relative">
-                  <ConvoyMarkerPin color="hsl(var(--accent))" label="D" />
-                  <div className="absolute -top-8 left-1/2 -translate-x-1/2 rounded-full border bg-background/90 px-2 py-1 text-[10px] font-semibold shadow-sm">
-                    Destination
-                  </div>
-                </div>
+                <DestinationMarker />
               </MarkerContent>
               <MarkerPopup className="min-w-[200px]">
                 <div className="space-y-1">
-                  <p className="font-semibold">Destination</p>
-                  <p className="text-xs text-muted-foreground">{destination.name}</p>
+                  <p className="font-semibold">{selectedDestination ? "Selected destination" : "Destination"}</p>
+                  <p className="text-sm text-foreground/80">{visibleDestination.name}</p>
+                  <p className="text-xs text-muted-foreground">
+                    {visibleDestination.lat.toFixed(6)}, {visibleDestination.lng.toFixed(6)}
+                  </p>
                 </div>
               </MarkerPopup>
             </MapMarker>
@@ -1877,19 +1156,12 @@ export default function ConvoyMap() {
             showZoom
             showCompass
             showFullscreen
-            onLocate={({ longitude, latitude }) => {
-              setViewport((current) => ({
-                ...current,
-                center: [longitude, latitude],
-                zoom: Math.max(current.zoom, 14),
-              }));
-            }}
           />
         </AppMap>
 
-        <ViewportHud viewport={viewport} />
+        {!pinTarget && <ViewportHud viewport={viewport} />}
 
-        <div className="absolute left-3 top-20 z-20 flex flex-col gap-2">
+        <div hidden={Boolean(pinTarget)} className="absolute left-3 top-20 z-20 flex flex-col gap-2 [&[hidden]]:hidden">
           <div className="w-[min(360px,calc(100vw-1.5rem))] rounded-2xl border bg-card/95 p-3 shadow-lg backdrop-blur-md">
             <div className="flex items-start justify-between gap-3">
               <div className="min-w-0">
@@ -1923,11 +1195,11 @@ export default function ConvoyMap() {
                 size="sm"
                 variant="secondary"
                 onClick={handleRetryLocationAccess}
-                disabled={requestingLocationAccess}
+                disabled={Boolean(environmentError)}
                 className="gap-2"
               >
                 <LocateFixed className="h-4 w-4" />
-                {requestingLocationAccess ? "Retrying..." : "Retry Location"}
+                {liveFix ? "Center on my location" : "Retry location"}
               </Button>
             </div>
           </div>
@@ -1960,10 +1232,12 @@ export default function ConvoyMap() {
                     }}
                     className="justify-start gap-3 px-3 py-5"
                   >
-                    <div className="flex items-center gap-1.5">
-                      <Clock className="h-3.5 w-3.5" />
-                      <span className="font-medium">{formatDuration(route.duration)}</span>
-                    </div>
+                    {route.mode === "routed" && (
+                      <div className="flex items-center gap-1.5">
+                        <Clock className="h-3.5 w-3.5" />
+                        <span className="font-medium">{formatDuration(route.duration)}</span>
+                      </div>
+                    )}
                     <div className="flex items-center gap-1.5 text-xs opacity-80">
                       <RouteIcon className="h-3 w-3" />
                       {formatDistance(route.distance)}
@@ -1986,7 +1260,12 @@ export default function ConvoyMap() {
         </div>
 
         <div className="absolute top-3 left-1/2 z-30 w-[min(680px,92vw)] -translate-x-1/2">
-          {plannerMinimized ? (
+          {pinTarget ? (
+            <div className="flex items-center justify-between gap-3 rounded-xl border bg-card/95 px-4 py-3 shadow-lg" role="status">
+              <p className="text-sm font-semibold">Tap the map to place the {pinTarget === "from" ? "starting point" : "destination"}.</p>
+              <Button type="button" size="sm" variant="outline" onClick={() => setPinTarget(null)}>Cancel</Button>
+            </div>
+          ) : plannerMinimized ? (
             <button
               type="button"
               className="flex w-full items-center justify-between gap-3 rounded-xl border bg-card/95 px-4 py-3 text-left shadow-lg backdrop-blur-md transition-colors hover:bg-card"
@@ -1999,9 +1278,10 @@ export default function ConvoyMap() {
                 <p className="truncate text-sm font-semibold">
                   {routeOriginLabel} to {routeDestinationLabel}
                 </p>
+                {routeError && <p className="mt-1 text-xs text-amber-700">{routeError}</p>}
               </div>
               <div className="flex shrink-0 items-center gap-2">
-                {routeInfo && (
+                {routeInfo?.durationMin != null && (
                   <span className="rounded-full border px-2 py-1 text-[11px] text-muted-foreground">
                     {Math.round(routeInfo.durationMin)} min
                   </span>
@@ -2038,12 +1318,17 @@ export default function ConvoyMap() {
                     From
                   </p>
                   <Input
-                    placeholder="Your location or search a starting point"
+                    placeholder="Search a place or enter coordinates"
                     value={originInput}
-                    onFocus={handleOriginInputFocus}
+                    aria-label="Starting point"
+                    onFocus={(event) => { if (originMode === "live") event.currentTarget.select(); }}
                     onChange={(event) => handleOriginInputChange(event.target.value)}
                     className="flex-1"
+                    disabled={applyingRoute}
                   />
+                  <Button type="button" variant="ghost" size="sm" onClick={() => handlePickPin("from")} disabled={!mapReady || applyingRoute}>
+                    <MapPin className="mr-1.5 size-3.5" /> Pin start
+                  </Button>
                 </div>
 
                 <div className="space-y-1">
@@ -2051,14 +1336,21 @@ export default function ConvoyMap() {
                     To
                   </p>
                   <Input
-                    placeholder="Search destination"
+                    aria-label="Destination"
+                    placeholder="Search a place or enter coordinates"
                     value={destInput}
                     onChange={(event) => {
                       setPlannerMinimized(false);
-                      setDestInput(event.target.value);
+                      setDestinationDraft(event.target.value);
+                      setSelectedDestination(null);
+                      setPlannerError(null);
                     }}
                     className="flex-1"
+                    disabled={applyingRoute}
                   />
+                  <Button type="button" variant="ghost" size="sm" onClick={() => handlePickPin("to")} disabled={!mapReady || applyingRoute}>
+                    <MapPin className="mr-1.5 size-3.5" /> Pin destination
+                  </Button>
                 </div>
 
                 <div className="flex items-end gap-2">
@@ -2067,6 +1359,7 @@ export default function ConvoyMap() {
                     size="sm"
                     variant={originMode === "live" ? "secondary" : "outline"}
                     onClick={handleUseLiveOrigin}
+                    disabled={applyingRoute}
                     className="gap-2"
                   >
                     <LocateFixed className="h-4 w-4" />
@@ -2075,23 +1368,23 @@ export default function ConvoyMap() {
                   <Button
                     type="submit"
                     size="sm"
-                    disabled={!destInput.trim()}
+                    disabled={!destInput.trim() || applyingRoute}
                     className="gap-2"
                   >
                     <Navigation className="h-4 w-4" />
-                    Go
+                    {applyingRoute ? "Saving..." : "Go"}
                   </Button>
                 </div>
               </div>
 
               <div className="flex flex-wrap gap-2 text-xs text-muted-foreground">
                 <Badge variant={originMode === "live" ? "secondary" : "outline"} className="text-[10px]">
-                  {originMode === "live" ? "Using live location" : "Custom start"}
+                  {originMode === "live" ? liveFix ? "Live start" : "Waiting for GPS" : "Custom start"}
                 </Badge>
                 <span>
                   {originMode === "live"
-                    ? myLocation
-                      ? "Your route origin updates smoothly from your live GPS."
+                    ? liveFix
+                      ? "Your starting point follows your live location."
                       : liveOriginWaitingMessage
                     : manualOrigin?.name || "Search for where you're starting from."}
                 </span>
@@ -2102,6 +1395,11 @@ export default function ConvoyMap() {
                   {searchingOrigin ? "Searching starting point…" : "Searching destination…"}
                 </p>
               )}
+
+              {(originSearchFailed || destinationSearchFailed) && (
+                <p className="text-xs text-amber-700">Place search is unavailable. Enter latitude, longitude or pin the point on the map.</p>
+              )}
+              {selectedDestination && <p className="text-xs text-muted-foreground">Destination selected. Tap Go to use it.</p>}
 
               {originSuggestions.length > 0 && (
                 <div className="max-h-56 overflow-auto rounded-lg border bg-popover shadow">
@@ -2183,14 +1481,16 @@ export default function ConvoyMap() {
                     <Ruler className="h-4 w-4" />
                     {routeInfo.distanceKm.toFixed(1)} km
                   </span>
-                  <span className="flex items-center gap-1">
-                    <Clock className="h-4 w-4" />
-                    {Math.round(routeInfo.durationMin)} min
-                  </span>
+                  {routeInfo.durationMin !== null && (
+                    <span className="flex items-center gap-1">
+                      <Clock className="h-4 w-4" />
+                      {Math.round(routeInfo.durationMin)} min
+                    </span>
+                  )}
                 </div>
               )}
 
-              {routeError && <p className="text-xs text-amber-600">{routeError}</p>}
+              {(plannerError || routeError) && <p role="status" className="text-xs text-amber-700">{plannerError ?? routeError}</p>}
 
               {locationError && (
                 <p className="text-xs text-destructive">{locationError}</p>
@@ -2273,7 +1573,8 @@ export default function ConvoyMap() {
             {routeInfo && (
               <Badge variant="secondary" className="gap-1">
                 <Navigation className="h-3 w-3" />
-                {routeInfo.distanceKm.toFixed(1)} km · {Math.round(routeInfo.durationMin)} min
+                {routeInfo.distanceKm.toFixed(1)} km
+                {routeInfo.durationMin !== null && ` · ${Math.round(routeInfo.durationMin)} min`}
               </Badge>
             )}
           </div>

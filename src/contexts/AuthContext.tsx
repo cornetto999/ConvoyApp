@@ -1,5 +1,5 @@
 import React, { createContext, useContext, useEffect, useState } from "react";
-import { Session, User } from "@supabase/supabase-js";
+import { AuthApiError, type Session, type User } from "@supabase/supabase-js";
 import { supabase } from "@/integrations/supabase/client";
 import type { Profile } from "@/types/convoy";
 
@@ -15,10 +15,15 @@ interface AuthContextType {
   loading: boolean;
   signUp: (email: string, password: string, displayName: string) => Promise<SignUpResult>;
   signIn: (email: string, password: string) => Promise<void>;
+  resendVerification: (email: string) => Promise<void>;
   signOut: () => Promise<void>;
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
+
+function getVerificationRedirect() {
+  return new URL("/login?verified=1", window.location.origin).href;
+}
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [session, setSession] = useState<Session | null>(null);
@@ -94,13 +99,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const signUp = async (email: string, password: string, displayName: string) => {
-    const emailRedirectTo = `${window.location.origin}/login?verified=1`;
     const { data, error } = await supabase.auth.signUp({
       email,
       password,
       options: {
         data: { display_name: displayName },
-        emailRedirectTo,
+        emailRedirectTo: getVerificationRedirect(),
       },
     });
 
@@ -119,12 +123,21 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     };
   };
 
+  const resendVerification = async (email: string) => {
+    const { error } = await supabase.auth.resend({
+      type: "signup",
+      email,
+      options: { emailRedirectTo: getVerificationRedirect() },
+    });
+    if (error) throw error;
+  };
+
   const signIn = async (email: string, password: string) => {
     const { data, error } = await supabase.auth.signInWithPassword({ email, password });
     if (error) throw error;
     if (!data.user?.email_confirmed_at) {
       await supabase.auth.signOut();
-      throw new Error("Please verify your email before signing in.");
+      throw new AuthApiError("Email not confirmed", 400, "email_not_confirmed");
     }
   };
 
@@ -134,7 +147,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   };
 
   return (
-    <AuthContext.Provider value={{ session, user, profile, loading, signUp, signIn, signOut }}>
+    <AuthContext.Provider value={{ session, user, profile, loading, signUp, signIn, resendVerification, signOut }}>
       {children}
     </AuthContext.Provider>
   );

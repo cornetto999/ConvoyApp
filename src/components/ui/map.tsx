@@ -299,8 +299,11 @@ const Map = forwardRef<MapRef, MapProps>(function Map(
     }
 
     internalUpdateRef.current = true;
-    mapInstance.jumpTo(next);
-    internalUpdateRef.current = false;
+    mapInstance.easeTo({ ...next, duration: 400 });
+    // Reset the internal update flag after animation finishes
+    setTimeout(() => {
+      internalUpdateRef.current = false;
+    }, 450);
   }, [mapInstance, isControlled, viewport]);
 
   // Handle style change

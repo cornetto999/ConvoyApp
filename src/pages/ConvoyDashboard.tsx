@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import { useAuth } from "@/contexts/AuthContext";
 import { supabase } from "@/integrations/supabase/client";
@@ -25,10 +25,11 @@ import {
   Radio, Bell, RefreshCw
 } from "lucide-react";
 import type { Convoy, ConvoyMember, Profile } from "@/types/convoy";
+import { useConvoyPlaceSearch } from "@/hooks/use-convoy-place-search";
+import { parseCoordinateSuggestion } from "@/lib/convoy-place-search";
+import { isValidCoordinate } from "@/lib/convoy-position";
 import {
-  getCuratedDestinationSuggestions,
   getQuickDestinationSuggestions,
-  mergeDestinationSuggestions,
   type DestinationSuggestion,
 } from "@/lib/destination-suggestions";
 
@@ -54,15 +55,14 @@ export default function ConvoyDashboard() {
   const [loading, setLoading] = useState(true);
   const [myRole, setMyRole] = useState<string | null>(null);
   const [destinationInput, setDestinationInput] = useState("");
-  const [destinationSuggestions, setDestinationSuggestions] = useState<DestinationSuggestion[]>([]);
-  const [searchingDest, setSearchingDest] = useState(false);
   const [selectedCoords, setSelectedCoords] = useState<{ lat: number; lng: number } | null>(null);
   const [miniViewport, setMiniViewport] = useState<MapViewport | null>(null);
   const [settingDest, setSettingDest] = useState(false);
   const [regroupOpen, setRegroupOpen] = useState(false);
   const [regroupMessage, setRegroupMessage] = useState("");
   const quickDestinationSuggestions = useMemo(() => getQuickDestinationSuggestions(6), []);
-  const skipDestinationSearchRef = useRef(false);
+  const { suggestions: destinationSuggestions, searching: searchingDest, failed: searchFailed } =
+    useConvoyPlaceSearch(destinationInput, !selectedCoords);
 
   useEffect(() => {
     if (!id || !user) return;
@@ -79,7 +79,7 @@ export default function ConvoyDashboard() {
       )
       .on("postgres_changes", { event: "INSERT", schema: "public", table: "convoy_alerts", filter: `convoy_id=eq.${id}` },
         (payload) => {
-          const alert = payload.new as any;
+          const alert = payload.new as { type?: string; message?: string | null };
           if (alert.type === "regroup") {
             toast.warning(alert.message || "Regroup called!", { duration: 8000 });
           } else {
@@ -100,29 +100,21 @@ export default function ConvoyDashboard() {
     }
   }, [authLoading, user, navigate]);
 
+  const destinationLat = convoy?.destination_lat;
+  const destinationLng = convoy?.destination_lng;
   useEffect(() => {
-    const coords = selectedCoords
-      ?? (convoy?.destination_lat && convoy.destination_lng
-        ? { lat: convoy.destination_lat, lng: convoy.destination_lng }
-        : null);
-
-    if (!coords) {
+    if (destinationLat == null || destinationLng == null || !isValidCoordinate(destinationLat, destinationLng)) {
       setMiniViewport(null);
       return;
     }
 
     setMiniViewport({
-      center: [coords.lng, coords.lat],
-      zoom: 13,
+      center: [destinationLng, destinationLat],
+      zoom: 15,
       bearing: 0,
       pitch: 0,
     });
-  }, [
-    convoy?.destination_lat,
-    convoy?.destination_lng,
-    selectedCoords?.lat,
-    selectedCoords?.lng,
-  ]);
+  }, [destinationLat, destinationLng]);
 
   const loadConvoy = async () => {
     try {
@@ -133,14 +125,6 @@ export default function ConvoyDashboard() {
       }
 
       setConvoy(data);
-      if (data?.destination_lat && data?.destination_lng) {
-        setSelectedCoords({ lat: data.destination_lat, lng: data.destination_lng });
-      } else if (data?.destination_address) {
-        const geocoded = await geocodeAddress(data.destination_address);
-        if (geocoded) {
-          setSelectedCoords(geocoded);
-        }
-      }
     } catch (error) {
       console.error("Failed to load convoy:", error);
       toast.error("Failed to load convoy");
@@ -225,25 +209,31 @@ export default function ConvoyDashboard() {
     const trimmedAddress = destinationInput.trim();
     if (!trimmedAddress) return;
 
+    const coordinate = parseCoordinateSuggestion(trimmedAddress);
+    const resolvedCoords = selectedCoords ?? (coordinate ? { lat: coordinate.lat, lng: coordinate.lon } : null);
+    if (!resolvedCoords) {
+      toast.error("Choose a destination from the results, enter coordinates, or pin it on the convoy map.");
+      return;
+    }
+
     setSettingDest(true);
     try {
-      const resolvedCoords = selectedCoords ?? await geocodeAddress(trimmedAddress);
-
-      await supabase.from("convoys").update({
+      const { data, error } = await supabase.from("convoys").update({
         destination_address: trimmedAddress,
-        destination_lat: resolvedCoords?.lat ?? null,
-        destination_lng: resolvedCoords?.lng ?? null,
-      }).eq("id", id!);
-      await supabase.from("trip_events").insert({
+        destination_lat: resolvedCoords.lat,
+        destination_lng: resolvedCoords.lng,
+      }).eq("id", id!).select("*").single();
+      if (error) throw error;
+      setConvoy(data);
+      setSelectedCoords(null);
+      setDestinationInput("");
+      const { error: eventError } = await supabase.from("trip_events").insert({
         convoy_id: id!,
         event_type: "convoy.destination_set",
         user_id: user!.id,
         payload: { address: trimmedAddress },
       });
-
-      setSelectedCoords(resolvedCoords);
-      setDestinationInput("");
-      setDestinationSuggestions([]);
+      if (eventError) console.warn("Could not log destination change:", eventError.message);
       toast.success("Destination set!");
     } catch {
       toast.error("Failed to set destination");
@@ -289,90 +279,10 @@ export default function ConvoyDashboard() {
     }
   };
 
-  // Destination autocomplete (Nominatim)
-  useEffect(() => {
-    if (skipDestinationSearchRef.current) {
-      skipDestinationSearchRef.current = false;
-      setDestinationSuggestions([]);
-      setSearchingDest(false);
-      return;
-    }
-
-    if (!destinationInput.trim()) {
-      setDestinationSuggestions([]);
-      setSearchingDest(false);
-      return;
-    }
-
-    const curatedSuggestions = getCuratedDestinationSuggestions(destinationInput, 6);
-    const controller = new AbortController();
-    const timer = setTimeout(async () => {
-      setSearchingDest(true);
-      try {
-        const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(destinationInput)}&format=json&limit=5`;
-        const res = await fetch(url, {
-          headers: { "Accept-Language": "en", "User-Agent": "ConvoyApp/1.0" },
-          signal: controller.signal,
-        });
-        const json = await res.json();
-        const remoteSuggestions = (json || []).map((r: any) => ({
-          display_name: r.display_name as string,
-          lat: parseFloat(r.lat),
-          lon: parseFloat(r.lon),
-          source: "search" as const,
-        }));
-        setDestinationSuggestions(
-          mergeDestinationSuggestions(curatedSuggestions, remoteSuggestions, 8),
-        );
-      } catch (_) {
-        if (!controller.signal.aborted) setDestinationSuggestions(curatedSuggestions);
-      } finally {
-        setSearchingDest(false);
-      }
-    }, 250);
-    return () => {
-      clearTimeout(timer);
-      controller.abort();
-    };
-  }, [destinationInput]);
-
-  const handleSelectSuggestion = async (s: DestinationSuggestion) => {
-    skipDestinationSearchRef.current = true;
-    setDestinationInput(s.display_name);
-    setDestinationSuggestions([]);
-    if (typeof s.lat === "number" && typeof s.lon === "number") {
-      setSelectedCoords({ lat: s.lat, lng: s.lon });
-      return;
-    }
-
-    setSearchingDest(true);
-    const resolvedCoords = await geocodeAddress(s.display_name);
-    setSearchingDest(false);
-
-    if (!resolvedCoords) {
-      toast.error("We couldn't find that destination yet. Try a more specific place name.");
-      return;
-    }
-
-    setSelectedCoords(resolvedCoords);
-  };
-
-  const geocodeAddress = async (address: string): Promise<{ lat: number; lng: number } | null> => {
-    try {
-      const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(address)}&format=json&limit=1`;
-      const res = await fetch(url, {
-        headers: { "Accept-Language": "en", "User-Agent": "ConvoyApp/1.0" },
-      });
-      const json = await res.json();
-      const hit = json?.[0];
-      if (!hit) return null;
-      return {
-        lat: parseFloat(hit.lat),
-        lng: parseFloat(hit.lon),
-      };
-    } catch {
-      return null;
-    }
+  const handleSelectSuggestion = ({ lat, lon, display_name }: DestinationSuggestion) => {
+    if (lat === undefined || lon === undefined || !isValidCoordinate(lat, lon)) return;
+    setDestinationInput(display_name);
+    setSelectedCoords({ lat, lng: lon });
   };
 
   const isLeader = myRole === "leader" || convoy?.leader_id === user?.id;
@@ -490,7 +400,7 @@ export default function ConvoyDashboard() {
                       </AppMap>
                     ) : (
                       <div className="absolute inset-0 grid place-items-center text-sm text-muted-foreground">
-                        Loading map...
+                        Choose a destination to set its exact location.
                       </div>
                     )}
                   </div>
@@ -502,26 +412,28 @@ export default function ConvoyDashboard() {
                           Change
                         </Button>
                       </DialogTrigger>
-                      <DialogContent>
+                      <DialogContent className="max-h-[90dvh] overflow-y-auto">
                         <DialogHeader>
                           <DialogTitle>Update Destination</DialogTitle>
-                          <DialogDescription>Enter a new destination address.</DialogDescription>
+                          <DialogDescription>Choose a search result or enter latitude, longitude.</DialogDescription>
                         </DialogHeader>
                         <form onSubmit={handleSetDestination} className="space-y-4">
                           <div className="space-y-2">
-                            <Label>Destination Address</Label>
+                            <Label htmlFor="dashboard-destination">Destination Address</Label>
                             <div className="relative">
                               <Input
-                                placeholder="123 Main St, City, State"
+                                id="dashboard-destination"
+                                placeholder="Place, barangay, city, or coordinates"
                                 value={destinationInput}
                                 onChange={(e) => {
                                   setDestinationInput(e.target.value);
                                   setSelectedCoords(null);
                                 }}
                                 required
+                                disabled={settingDest}
                               />
                               {destinationSuggestions.length > 0 && (
-                                <div className="absolute z-20 mt-1 max-h-56 w-full overflow-auto rounded-md border bg-popover shadow-lg">
+                                <div className="mt-2 max-h-56 w-full overflow-auto rounded-md border bg-popover">
                                   {destinationSuggestions.map((s, idx) => (
                                     <button
                                       key={`${s.display_name}-${idx}`}
@@ -543,6 +455,7 @@ export default function ConvoyDashboard() {
                             {searchingDest && (
                               <p className="text-[11px] text-muted-foreground">Searching…</p>
                             )}
+                            {searchFailed && <p className="text-xs text-muted-foreground">Search unavailable. Enter latitude, longitude or use the convoy map.</p>}
                             {!destinationSuggestions.length && shouldShowQuickPicks && (
                               <div className="rounded-lg border bg-muted/30 p-3">
                                 <p className="text-xs font-medium text-muted-foreground">
@@ -591,16 +504,18 @@ export default function ConvoyDashboard() {
                     <form onSubmit={handleSetDestination} className="flex gap-2">
                       <div className="flex-1 relative">
                         <Input
-                          placeholder="Enter destination address"
+                          aria-label="Destination address"
+                          placeholder="Place, barangay, city, or coordinates"
                           value={destinationInput}
                           onChange={(e) => {
                             setDestinationInput(e.target.value);
                             setSelectedCoords(null);
                           }}
                           required
+                          disabled={settingDest}
                         />
                         {destinationSuggestions.length > 0 && (
-                          <div className="absolute z-20 mt-1 w-full rounded-md border bg-popover shadow-lg max-h-56 overflow-auto">
+                          <div className="mt-2 max-h-56 w-full overflow-auto rounded-md border bg-popover">
                             {destinationSuggestions.map((s, idx) => (
                               <button
                                 key={`${s.display_name}-${idx}`}
@@ -627,6 +542,7 @@ export default function ConvoyDashboard() {
                         Set
                       </Button>
                     </form>
+                    {searchFailed && <p className="text-xs text-muted-foreground">Search unavailable. Enter latitude, longitude or use the convoy map.</p>}
                     {shouldShowQuickPicks && (
                       <div className="rounded-lg border bg-muted/30 p-3 text-left">
                         <div className="mb-3 flex items-center justify-between gap-2">

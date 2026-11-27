@@ -141,15 +141,15 @@ export function getCuratedDestinationSuggestions(query: string, limit = 6) {
 }
 
 export function mergeDestinationSuggestions(
-  curatedSuggestions: DestinationSuggestion[],
-  remoteSuggestions: DestinationSuggestion[],
+  primary: DestinationSuggestion[],
+  secondary: DestinationSuggestion[],
   limit = 8,
 ) {
   const merged: DestinationSuggestion[] = [];
   const seen = new Set<string>();
 
-  for (const suggestion of [...curatedSuggestions, ...remoteSuggestions]) {
-    const key = normalize(suggestion.display_name);
+  for (const suggestion of [...primary, ...secondary]) {
+    const key = `${normalize(suggestion.display_name)}:${suggestion.lat?.toFixed(4)},${suggestion.lon?.toFixed(4)}`;
     if (seen.has(key)) continue;
     seen.add(key);
     merged.push(suggestion);
