@@ -55,11 +55,9 @@ export function getGeolocationErrorMessage(
     case GEOLOCATION_PERMISSION_DENIED:
       return "Permission denied. Please allow location access.";
     case GEOLOCATION_POSITION_UNAVAILABLE:
-      return retrying && context === "tracking"
-        ? "Location unavailable. Try moving outdoors or enabling GPS."
-        : "Location unavailable. Try moving outdoors or enabling GPS.";
+      return "Location unavailable. Try moving outdoors or enabling GPS.";
     case GEOLOCATION_TIMEOUT:
-      return "Location request timed out. Retrying...";
+      return retrying ? "Location request timed out. Retrying..." : "Location request timed out.";
     default:
       return context === "auth"
         ? "Turn on location to use live convoy tracking and member speed updates."

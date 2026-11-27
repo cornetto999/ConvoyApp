@@ -134,6 +134,38 @@ export type Database = {
           },
         ]
       }
+      convoy_routes: {
+        Row: {
+          convoy_id: string
+          destination_lat: number
+          destination_lng: number
+          route: Json
+          shared_by: string
+        }
+        Insert: {
+          convoy_id: string
+          destination_lat: number
+          destination_lng: number
+          route: Json
+          shared_by: string
+        }
+        Update: {
+          convoy_id?: string
+          destination_lat?: number
+          destination_lng?: number
+          route?: Json
+          shared_by?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "convoy_routes_convoy_id_fkey"
+            columns: ["convoy_id"]
+            isOneToOne: true
+            referencedRelation: "convoys"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
       convoys: {
         Row: {
           code: string

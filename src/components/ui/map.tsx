@@ -1198,6 +1198,8 @@ type MapClusterLayerProps<
   clusterThresholds?: [number, number];
   /** Color for unclustered individual points (default: "#3b82f6") */
   pointColor?: string;
+  /** Feature property to display above unclustered individual points */
+  pointLabelProperty?: string;
   /** Callback when an unclustered point is clicked */
   onPointClick?: (
     feature: GeoJSON.Feature<GeoJSON.Point, P>,
@@ -1220,6 +1222,7 @@ function MapClusterLayer<
   clusterColors = ["#22c55e", "#eab308", "#ef4444"],
   clusterThresholds = [100, 750],
   pointColor = "#3b82f6",
+  pointLabelProperty,
   onPointClick,
   onClusterClick,
 }: MapClusterLayerProps<P>) {
@@ -1229,6 +1232,7 @@ function MapClusterLayer<
   const clusterLayerId = `clusters-${id}`;
   const clusterCountLayerId = `cluster-count-${id}`;
   const unclusteredLayerId = `unclustered-point-${id}`;
+  const pointLabelLayerId = `unclustered-label-${id}`;
 
   const stylePropsRef = useRef({
     clusterColors,
@@ -1310,8 +1314,27 @@ function MapClusterLayer<
       },
     });
 
+    if (pointLabelProperty) {
+      map.addLayer({
+        id: pointLabelLayerId,
+        type: "symbol",
+        source: sourceId,
+        filter: ["!", ["has", "point_count"]],
+        layout: {
+          "text-field": ["to-string", ["get", pointLabelProperty]],
+          "text-font": ["Open Sans Regular"],
+          "text-size": 11,
+          "text-anchor": "bottom",
+          "text-offset": [0, -0.8],
+        },
+        paint: { "text-color": "#f8fafc", "text-halo-color": "#0f172a", "text-halo-width": 1.5 },
+      });
+    }
+
     return () => {
       try {
+        if (map.getLayer(pointLabelLayerId))
+          map.removeLayer(pointLabelLayerId);
         if (map.getLayer(clusterCountLayerId))
           map.removeLayer(clusterCountLayerId);
         if (map.getLayer(unclusteredLayerId))
@@ -1323,7 +1346,7 @@ function MapClusterLayer<
       }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isLoaded, map, sourceId]);
+  }, [isLoaded, map, sourceId, pointLabelProperty]);
 
   // Update source data when data prop changes (only for non-URL data)
   useEffect(() => {

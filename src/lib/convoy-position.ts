@@ -5,7 +5,7 @@ export type Coordinate = { lat: number; lng: number };
 export type ConvoyFix = Coordinate & {
   accuracy: number;
   timestamp: number;
-  speed: number;
+  speed: number | null;
   heading: number | null;
 };
 
@@ -44,9 +44,15 @@ export function selectConvoyFix(
     lng: longitude,
     accuracy,
     timestamp,
-    speed: speed !== null && Number.isFinite(speed) && speed > 0 ? speed * 3.6 : 0,
+    speed: speed !== null && Number.isFinite(speed) && speed >= 0 ? speed * 3.6 : null,
     heading: heading !== null && Number.isFinite(heading) ? heading : null,
   };
+}
+
+export function formatLiveSpeed(speed: number | null, stale = false) {
+  if (stale) return "Stale";
+  if (speed === null || !Number.isFinite(speed) || speed < 0) return "No speed";
+  return `${Number(speed.toFixed(1))} km/h`;
 }
 
 export function accuracyOutline({ lat, lng, accuracy }: ConvoyFix): [number, number][] {

@@ -11,13 +11,7 @@ import {
   Dialog, DialogContent, DialogDescription, DialogHeader,
   DialogTitle, DialogTrigger
 } from "@/components/ui/dialog";
-import {
-  Map as AppMap,
-  MapMarker,
-  MarkerContent,
-  MarkerPopup,
-  type MapViewport,
-} from "@/components/ui/map";
+import { DestinationRoutePreview } from "@/components/DestinationRoutePreview";
 import { toast } from "sonner";
 import {
   Navigation, Copy, MapPin, Users, ArrowLeft, Crown,
@@ -35,17 +29,6 @@ import {
 
 type MemberWithProfile = ConvoyMember & { profiles: Profile | null };
 
-function DestinationPreviewPin() {
-  return (
-    <div className="relative flex flex-col items-center">
-      <div className="relative flex h-9 w-9 items-center justify-center rounded-full border-2 border-white bg-[hsl(var(--accent))] text-xs font-black text-white shadow-xl">
-        D
-      </div>
-      <div className="-mt-1 h-3 w-3 rotate-45 rounded-[2px] border-r-2 border-b-2 border-white bg-[hsl(var(--accent))] shadow-md" />
-    </div>
-  );
-}
-
 export default function ConvoyDashboard() {
   const { id } = useParams<{ id: string }>();
   const { user, loading: authLoading } = useAuth();
@@ -56,7 +39,6 @@ export default function ConvoyDashboard() {
   const [myRole, setMyRole] = useState<string | null>(null);
   const [destinationInput, setDestinationInput] = useState("");
   const [selectedCoords, setSelectedCoords] = useState<{ lat: number; lng: number } | null>(null);
-  const [miniViewport, setMiniViewport] = useState<MapViewport | null>(null);
   const [settingDest, setSettingDest] = useState(false);
   const [regroupOpen, setRegroupOpen] = useState(false);
   const [regroupMessage, setRegroupMessage] = useState("");
@@ -102,19 +84,8 @@ export default function ConvoyDashboard() {
 
   const destinationLat = convoy?.destination_lat;
   const destinationLng = convoy?.destination_lng;
-  useEffect(() => {
-    if (destinationLat == null || destinationLng == null || !isValidCoordinate(destinationLat, destinationLng)) {
-      setMiniViewport(null);
-      return;
-    }
-
-    setMiniViewport({
-      center: [destinationLng, destinationLat],
-      zoom: 15,
-      bearing: 0,
-      pitch: 0,
-    });
-  }, [destinationLat, destinationLng]);
+  const hasDestinationCoordinates = destinationLat != null && destinationLng != null
+    && isValidCoordinate(destinationLat, destinationLng);
 
   const loadConvoy = async () => {
     try {
@@ -365,45 +336,19 @@ export default function ConvoyDashboard() {
               <div className="space-y-3">
                 <p className="font-medium">{convoy.destination_address}</p>
                 <div className="flex flex-col gap-3">
-                  <div className="relative w-full aspect-video overflow-hidden rounded-lg border">
-                    {miniViewport ? (
-                      <AppMap
-                        className="absolute inset-0"
-                        viewport={miniViewport}
-                        onViewportChange={setMiniViewport}
-                        dragPan={false}
-                        dragRotate={false}
-                        scrollZoom={false}
-                        doubleClickZoom={false}
-                        boxZoom={false}
-                        touchZoomRotate={false}
-                        keyboard={false}
-                        attributionControl={false}
-                      >
-                        <MapMarker
-                          longitude={miniViewport.center[0]}
-                          latitude={miniViewport.center[1]}
-                          anchor="bottom"
-                        >
-                          <MarkerContent>
-                            <DestinationPreviewPin />
-                          </MarkerContent>
-                          <MarkerPopup className="min-w-[180px]">
-                            <div className="space-y-1">
-                              <p className="font-semibold">Destination</p>
-                              <p className="text-xs text-muted-foreground">
-                                {convoy.destination_address}
-                              </p>
-                            </div>
-                          </MarkerPopup>
-                        </MapMarker>
-                      </AppMap>
-                    ) : (
-                      <div className="absolute inset-0 grid place-items-center text-sm text-muted-foreground">
-                        Choose a destination to set its exact location.
-                      </div>
-                    )}
-                  </div>
+                  {hasDestinationCoordinates ? (
+                    <DestinationRoutePreview
+                      key={`${destinationLng},${destinationLat}`}
+                      lat={destinationLat}
+                      lng={destinationLng}
+                      address={convoy.destination_address}
+                      plannerPath={`/convoy/${id}/map`}
+                    />
+                  ) : (
+                    <p className="rounded-lg border p-4 text-sm text-muted-foreground">
+                      Choose a destination to set its exact location and see driving directions.
+                    </p>
+                  )}
                   {isLeader && (
                     <Dialog>
                       <DialogTrigger asChild>

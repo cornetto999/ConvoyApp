@@ -27,9 +27,27 @@ import { Input } from "@/components/ui/input";
 import { useConvoyPosition } from "@/hooks/use-convoy-position";
 import { useConvoyPlaceSearch } from "@/hooks/use-convoy-place-search";
 import { coordinateSuggestion, parseCoordinateSuggestion } from "@/lib/convoy-place-search";
-import { accuracyOutline, isRoutingFix, isValidCoordinate, type Coordinate } from "@/lib/convoy-position";
+import {
+  accuracyOutline,
+  formatLiveSpeed,
+  isRoutingFix,
+  isValidCoordinate,
+  POSITION_MAX_AGE_MS,
+  type Coordinate,
+} from "@/lib/convoy-position";
 import { getQuickDestinationSuggestions, type DestinationSuggestion } from "@/lib/destination-suggestions";
 import { getGeolocationErrorMessage } from "@/lib/geolocation";
+import {
+  fetchDrivingRoutes,
+  formatDistance,
+  formatDuration,
+  haversineMeters,
+  parseDrivingRoute,
+  sameRoute,
+  sameRoutePoint,
+  type RouteCoordinate,
+  type RouteOption,
+} from "@/lib/convoy-routing";
 import {
   Map as AppMap,
   MapClusterLayer,
@@ -38,28 +56,30 @@ import {
   MapPopup,
   MapRoute,
   MarkerContent,
+  MarkerLabel,
   MarkerPopup,
   type MapRef,
   type MapViewport,
 } from "@/components/ui/map";
 import type { Convoy, ConvoyMember, MemberLocation, Profile } from "@/types/convoy";
+import type { Tables } from "@/integrations/supabase/types";
 
 type MemberWithProfile = ConvoyMember & { profiles: Profile | null };
 type NamedCoordinate = Coordinate & { name: string };
-type RouteCoordinate = [number, number];
-type RouteOption = {
-  coordinates: RouteCoordinate[];
-  duration: number;
-  distance: number;
-  mode: "routed" | "direct";
+type RouteSearch = {
+  origin: Coordinate;
+  destination: Coordinate;
+  via: Coordinate | null;
+  options: { route: RouteOption; via: boolean }[];
+  message: string | null;
+  viaMessage: string | null;
 };
 type SpeedPointProperties = {
   userId: string;
   name: string;
-  speed: number;
+  speedLabel: string;
   role: string;
   updatedAt: string;
-  stale: boolean;
 };
 type GapAlert = {
   userId: string;
@@ -75,33 +95,22 @@ const DEFAULT_VIEWPORT: MapViewport = {
   pitch: 0,
 };
 const REROUTE_THRESHOLD_METERS = 50;
+const FOLLOW_THRESHOLD_METERS = 3;
 const LIVE_ORIGIN_LABEL = "Your location";
+const ROUTE_COLORS = ["#6366f1", "#0ea5e9", "#f97316", "#e879f9", "#fbbf24"];
+const SHARED_ROUTE_COLOR = "#22c55e";
 
-function haversineMeters(a: Coordinate, b: Coordinate) {
-  const R = 6371e3;
-  const toRad = (value: number) => (value * Math.PI) / 180;
-  const dLat = toRad(b.lat - a.lat);
-  const dLon = toRad(b.lng - a.lng);
-  const lat1 = toRad(a.lat);
-  const lat2 = toRad(b.lat);
-  const sinLat = Math.sin(dLat / 2);
-  const sinLon = Math.sin(dLon / 2);
-  const aVal = sinLat * sinLat + Math.cos(lat1) * Math.cos(lat2) * sinLon * sinLon;
-  const c = 2 * Math.atan2(Math.sqrt(aVal), Math.sqrt(1 - aVal));
-  return R * c;
+function isMemberLocationStale(updatedAt: string, now: number) {
+  const timestamp = Date.parse(updatedAt);
+  return !Number.isFinite(timestamp) || timestamp + POSITION_MAX_AGE_MS <= now;
 }
 
-function formatDuration(seconds: number) {
-  const mins = Math.round(seconds / 60);
-  if (mins < 60) return `${mins} min`;
-  const hours = Math.floor(mins / 60);
-  const remainingMins = mins % 60;
-  return `${hours}h ${remainingMins}m`;
-}
-
-function formatDistance(meters: number) {
-  if (meters < 1000) return `${Math.round(meters)} m`;
-  return `${(meters / 1000).toFixed(1)} km`;
+function MemberSpeedLabel({ speed, stale }: { speed: number | null; stale: boolean }) {
+  return (
+    <MarkerLabel className={`pointer-events-none mb-2 rounded-full border border-border/70 bg-background/95 px-2 py-0.5 font-semibold tabular-nums shadow-sm ${stale || speed === null ? "text-muted-foreground" : ""}`}>
+      {formatLiveSpeed(speed, stale)}
+    </MarkerLabel>
+  );
 }
 
 function getBearingDegrees(from: Coordinate, to: Coordinate) {
@@ -294,9 +303,14 @@ export default function ConvoyMap() {
   const [convoy, setConvoy] = useState<Convoy | null>(null);
   const [members, setMembers] = useState<MemberWithProfile[]>([]);
   const [locations, setLocations] = useState<MemberLocation[]>([]);
+  const [locationClock, setLocationClock] = useState(() => Date.now());
   const [showMembers, setShowMembers] = useState(false);
-  const [routeOptions, setRouteOptions] = useState<RouteOption[]>([]);
-  const [selectedRouteIndex, setSelectedRouteIndex] = useState(0);
+  const [routeSearch, setRouteSearch] = useState<RouteSearch | null>(null);
+  const [previewedRoute, setPreviewedRoute] = useState<RouteOption | null>(null);
+  const [storedRoute, setStoredRoute] = useState<Tables<"convoy_routes"> | null>(null);
+  const [viaPin, setViaPin] = useState<{ point: Coordinate; destination: Coordinate } | null>(null);
+  const [sharingRoute, setSharingRoute] = useState(false);
+  const [showRouteChoices, setShowRouteChoices] = useState(true);
   const [isLoadingRoutes, setIsLoadingRoutes] = useState(false);
   const [routeOrigin, setRouteOrigin] = useState<Coordinate | null>(null);
   const [originMode, setOriginMode] = useState<"live" | "manual">("live");
@@ -306,24 +320,21 @@ export default function ConvoyMap() {
   const [destinationDraft, setDestinationDraft] = useState<string | null>(null);
   const [selectedDestination, setSelectedDestination] = useState<NamedCoordinate | null>(null);
   const [applyingRoute, setApplyingRoute] = useState(false);
-  const [pinTarget, setPinTarget] = useState<"from" | "to" | null>(null);
-  const [routeError, setRouteError] = useState<string | null>(null);
+  const [pinTarget, setPinTarget] = useState<"from" | "to" | "via" | null>(null);
   const [plannerError, setPlannerError] = useState<string | null>(null);
   const [plannerMinimized, setPlannerMinimized] = useState(false);
+  const [switchToLive, setSwitchToLive] = useState(false);
   const [viewport, setViewport] = useState<MapViewport>(DEFAULT_VIEWPORT);
   const [mapInstance, setMapInstance] = useState<MapRef | null>(null);
   const [mapReady, setMapReady] = useState(false);
-  const [cameraLocked, setCameraLocked] = useState(false);
+  const [cameraMode, setCameraMode] = useState<"overview" | "free" | "follow">("overview");
   const [mapViewMode, setMapViewMode] = useState<"members" | "speed">("members");
   const [dismissedGapAlertUserId, setDismissedGapAlertUserId] = useState<string | null>(null);
-  const [selectedSpeedPoint, setSelectedSpeedPoint] = useState<{
-    coordinates: RouteCoordinate;
-    properties: SpeedPointProperties;
-  } | null>(null);
+  const [selectedSpeedUserId, setSelectedSpeedUserId] = useState<string | null>(null);
   const quickDestinationSuggestions = useMemo(() => getQuickDestinationSuggestions(6), []);
   const {
     fix: myLocation, stale, attempt: retryCount, permission: locationPermissionState,
-    error: gpsError, environmentError, retry: retryLocation,
+    error: gpsError, environmentError, phase: locationPhase, retry: retryLocation,
   } = useConvoyPosition(Boolean(id && user));
   const liveFix = stale || !isRoutingFix(myLocation) ? null : myLocation;
   const gpsOutline = useMemo(() => myLocation ? accuracyOutline(myLocation) : [], [myLocation]);
@@ -334,59 +345,91 @@ export default function ConvoyMap() {
     useConvoyPlaceSearch(destInput, !selectedDestination && destinationDraft !== null && !pinTarget);
 
   const hasCenteredOnUserRef = useRef(false);
+  const initialFrameRef = useRef<"destination" | "route" | null>(null);
   const localDestinationRef = useRef(false);
   const convoyRequestRef = useRef(0);
+  const sharedRouteRequestRef = useRef(0);
+  const isLeader = Boolean(user && convoy?.leader_id === user.id);
+  const via = viaPin && sameRoutePoint(viaPin.destination, destination) ? viaPin.point : null;
 
-  const selectedRoute = routeOptions[selectedRouteIndex] ?? null;
+  const sharedRoute = useMemo(() => {
+    if (!destination || !storedRoute || storedRoute.convoy_id !== id
+      || storedRoute.shared_by !== convoy?.leader_id
+      || storedRoute.destination_lat !== destination.lat || storedRoute.destination_lng !== destination.lng) return null;
+    return parseDrivingRoute(storedRoute.route);
+  }, [convoy?.leader_id, destination, id, storedRoute]);
+  const showSharedOnly = Boolean(sharedRoute && !isLeader);
+
+  const currentSearch = routeSearch && sameRoutePoint(routeSearch.origin, routeOrigin)
+    && sameRoutePoint(routeSearch.destination, destination) && sameRoutePoint(routeSearch.via, via)
+    ? routeSearch : null;
+  const routeError = showSharedOnly ? null : currentSearch?.message;
+  const routeChoices = useMemo(() => {
+    const options = sharedRoute && !isLeader ? [] : currentSearch?.options ?? [];
+    const choices = options.filter(({ route }) => !sameRoute(route, sharedRoute) && (!sharedRoute || route.mode !== "direct"));
+    const fastest = options.reduce<RouteOption | null>((best, { route }) => route.mode === "routed"
+      && (!best || route.duration < best.duration) ? route : best, null);
+    return [
+      ...(sharedRoute ? [{ id: "shared", route: sharedRoute, shared: true, label: "Convoy route", color: SHARED_ROUTE_COLOR,
+        fastest: sameRoute(sharedRoute, fastest) }] : []),
+      ...choices.map(({ route, via: viaRoad }, index) => ({
+        id: `option-${index}`, route, shared: false, color: ROUTE_COLORS[index % ROUTE_COLORS.length],
+        label: viaRoad ? "Via pinned road" : route.mode === "direct" ? "Straight-line distance" : `Route ${index + 1}`,
+        fastest: route === fastest,
+      })),
+    ];
+  }, [currentSearch, isLeader, sharedRoute]);
+
+  const selectedChoice = routeChoices.find(({ route }) => route === previewedRoute) ?? routeChoices[0];
+  const selectedRoute = selectedChoice?.route ?? null;
   const routeInfo = selectedRoute
     ? {
         distanceKm: selectedRoute.distance / 1000,
         durationMin: selectedRoute.mode === "routed" ? selectedRoute.duration / 60 : null,
       }
     : null;
-  const routeOriginLabel = originMode === "live" ? liveFix ? "My location" : "Locating..."
+  const routeOriginLabel = originMode === "live" ? liveFix ? "My location" : "Starting point needed"
     : manualOrigin?.name || originInput.trim() || "Custom start";
   const routeDestinationLabel = destination?.name || "No destination";
-  const locationError = environmentError ?? (gpsError === null ? null : getGeolocationErrorMessage({ code: gpsError }));
-  const locationLoading = !myLocation && !environmentError && locationPermissionState !== "denied";
+  const awaitingPermission = locationPhase === "requesting" && locationPermissionState !== "granted";
+  const needsPermission = locationPhase === "idle" && locationPermissionState !== "granted";
+  const locationLoading = locationPhase === "requesting" || locationPhase === "locating" || locationPhase === "retrying";
+  const locationError = environmentError
+    ?? (locationPhase === "unavailable" && locationPermissionState !== "granted"
+      ? "The browser did not return a location. Check for a permission prompt or try opening Convoy in Chrome or Safari."
+      : gpsError === null ? null : getGeolocationErrorMessage({ code: gpsError }, "tracking", locationPhase === "retrying"));
   const locationStatusMessage = liveFix ? "Location locked"
     : locationPermissionState === "denied" ? "Location access needed"
     : environmentError ? "Location unavailable"
+    : awaitingPermission ? "Waiting for location permission"
+    : locationPhase === "unavailable" ? stale ? "Last known location" : "No location fix yet"
+    : locationPhase === "retrying" ? "Reconnecting to location..."
+    : needsPermission ? "Location access needed"
     : stale ? "Last known location"
     : myLocation ? "Improving accuracy..."
-    : gpsError !== null ? "Weak signal, retrying..."
     : "Getting precise location...";
   const liveOriginWaitingMessage = locationError
     ? `${locationError} You can also pin a starting point.`
-    : "Waiting for a location accurate to 50 m or better. You can also choose or pin a starting point.";
+    : needsPermission ? "Enable location or choose a starting point."
+      : "Waiting for a location accurate to 50 m or better. You can also choose or pin a starting point.";
   const locationCoordinatesLabel = myLocation
     ? `Lat ${myLocation.lat.toFixed(5)}, Lng ${myLocation.lng.toFixed(5)} · Accuracy ±${Math.round(myLocation.accuracy)} m`
     : null;
-  const locationSourceLabel = stale ? "Last known" : liveFix ? "Device location"
-    : myLocation ? "Low accuracy" : "Davao map view";
-  const locationHint = !liveFix && locationPermissionState !== "denied" && !environmentError
-    ? "On your phone, enable Precise Location and keep the map open while it gets a fix."
+  const locationSourceLabel = stale ? "Last known" : liveFix ? "Device location" : myLocation ? "Low accuracy" : null;
+  const locationHint = liveFix || environmentError ? null
+    : locationPermissionState === "denied" ? "Allow location for this site in your browser settings, then retry."
+    : awaitingPermission ? "Choose Allow if the browser asks to use your location."
+    : needsPermission ? "Enable location to use your current position."
+    : manualOrigin ? "Your route from the selected starting point is still available."
     : null;
-
-  const sortedRoutes = useMemo(
-    () =>
-      routeOptions
-        .map((route, index) => ({ route, index }))
-        .sort((a, b) => {
-          if (a.index === selectedRouteIndex) return 1;
-          if (b.index === selectedRouteIndex) return -1;
-          return 0;
-        }),
-    [routeOptions, selectedRouteIndex],
-  );
 
   const speedClusterData = useMemo(() => {
     const features = locations
-      .map((location) => {
+      .flatMap((location) => {
         const member = members.find((currentMember) => currentMember.user_id === location.user_id);
-        if (!member) return null;
+        if (!member) return [];
 
-        return {
+        return [{
           type: "Feature" as const,
           geometry: {
             type: "Point" as const,
@@ -395,20 +438,34 @@ export default function ConvoyMap() {
           properties: {
             userId: location.user_id,
             name: member.profiles?.display_name || "Unknown",
-            speed: location.speed ?? 0,
+            speedLabel: formatLiveSpeed(location.speed, isMemberLocationStale(location.updated_at, locationClock)),
             role: member.role,
             updatedAt: location.updated_at,
-            stale: Date.now() - new Date(location.updated_at).getTime() > 30000,
           },
-        };
-      })
-      .filter(Boolean);
+        }];
+      });
 
     return {
       type: "FeatureCollection" as const,
       features,
     };
-  }, [locations, members]);
+  }, [locationClock, locations, members]);
+  const selectedSpeedPoint = speedClusterData.features.find((point) => point.properties.userId === selectedSpeedUserId);
+
+  useEffect(() => {
+    let nextExpiry = Infinity;
+    for (const location of locations) {
+      const deadline = Date.parse(location.updated_at) + POSITION_MAX_AGE_MS;
+      if (deadline > locationClock) nextExpiry = Math.min(nextExpiry, deadline);
+    }
+    if (!Number.isFinite(nextExpiry)) return;
+
+    const timer = window.setTimeout(
+      () => setLocationClock(Math.max(nextExpiry, Date.now())),
+      Math.max(0, nextExpiry - Date.now()),
+    );
+    return () => window.clearTimeout(timer);
+  }, [locationClock, locations]);
 
   const gapAlert = useMemo<GapAlert | null>(() => {
     if (!destination || locations.length < 2) return null;
@@ -416,7 +473,7 @@ export default function ConvoyMap() {
     const memberDistances = locations
       .map((location) => {
         const member = members.find((currentMember) => currentMember.user_id === location.user_id);
-        if (!member || Date.now() - Date.parse(location.updated_at) > 30_000) return null;
+        if (!member || isMemberLocationStale(location.updated_at, locationClock)) return null;
 
         return {
           userId: location.user_id,
@@ -464,7 +521,7 @@ export default function ConvoyMap() {
       coordinates: worstGap.coordinates,
       gapMeters: worstGap.gapMeters,
     };
-  }, [convoy?.leader_id, destination, locations, members]);
+  }, [convoy?.leader_id, destination, locationClock, locations, members]);
 
   const activeGapAlert =
     gapAlert && dismissedGapAlertUserId !== gapAlert.userId ? gapAlert : null;
@@ -477,7 +534,7 @@ export default function ConvoyMap() {
 
   useEffect(() => {
     if (mapViewMode !== "speed") {
-      setSelectedSpeedPoint(null);
+      setSelectedSpeedUserId(null);
     }
   }, [mapViewMode]);
 
@@ -507,6 +564,7 @@ export default function ConvoyMap() {
     void loadConvoy();
     void loadMembers();
     void loadLocations();
+    void loadSharedRoute();
     const channel = supabase
       .channel(`convoy-map-${id}`)
       .on(
@@ -517,7 +575,10 @@ export default function ConvoyMap() {
       .on(
         "postgres_changes",
         { event: "*", schema: "public", table: "convoys", filter: `id=eq.${id}` },
-        () => void loadConvoy(),
+        () => {
+          void loadConvoy();
+          void loadSharedRoute();
+        },
       )
       .on(
         "postgres_changes",
@@ -530,10 +591,22 @@ export default function ConvoyMap() {
         },
       )
       .subscribe();
+    const routeChannel = supabase
+      .channel(`convoy-shared-route-${id}`)
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "convoy_routes", filter: `convoy_id=eq.${id}` },
+        () => void loadSharedRoute(),
+      )
+      .subscribe((status) => {
+        if (status === "SUBSCRIBED") void loadSharedRoute();
+      });
 
     return () => {
       supabase.removeChannel(channel);
+      supabase.removeChannel(routeChannel);
       convoyRequestRef.current += 1;
+      sharedRouteRequestRef.current += 1;
     };
   }, [id, user]);
 
@@ -560,6 +633,22 @@ export default function ConvoyMap() {
       && previous?.lat === saved?.lat && previous?.lng === saved?.lng ? previous : saved);
   };
 
+  const loadSharedRoute = async () => {
+    const request = ++sharedRouteRequestRef.current;
+    const { data, error } = await supabase.from("convoy_routes").select("*").eq("convoy_id", id!).maybeSingle();
+    if (!error && request === sharedRouteRequestRef.current) setStoredRoute(data);
+  };
+
+  useEffect(() => {
+    if (isLeader || !convoy?.destination_address || !storedRoute || storedRoute.convoy_id !== id
+      || storedRoute.shared_by !== convoy.leader_id || storedRoute.destination_lat !== convoy.destination_lat
+      || storedRoute.destination_lng !== convoy.destination_lng) return;
+
+    localDestinationRef.current = false;
+    const target = { name: convoy.destination_address, lat: storedRoute.destination_lat, lng: storedRoute.destination_lng };
+    setDestination((previous) => previous?.name === target.name && sameRoutePoint(previous, target) ? previous : target);
+  }, [convoy, id, isLeader, storedRoute]);
+
   const loadMembers = async () => {
     const { data } = await supabase.from("convoy_members").select("*").eq("convoy_id", id!);
     if (!data || data.length === 0) {
@@ -581,6 +670,7 @@ export default function ConvoyMap() {
     const { data } = await supabase.from("member_locations").select("*").eq("convoy_id", id!);
     if (!data) return;
 
+    setLocationClock(Date.now());
     setLocations(data);
   };
 
@@ -623,33 +713,67 @@ export default function ConvoyMap() {
     };
   }, [id, userId]);
 
+  useEffect(() => {
+    if (!mapInstance) return;
+
+    const pauseCamera = ({ originalEvent }: { originalEvent?: Event }) => {
+      if (originalEvent) setCameraMode("free");
+    };
+    mapInstance.on("movestart", pauseCamera);
+    mapInstance.on("dragstart", pauseCamera);
+    mapInstance.on("zoomstart", pauseCamera);
+    return () => {
+      mapInstance.off("movestart", pauseCamera);
+      mapInstance.off("dragstart", pauseCamera);
+      mapInstance.off("zoomstart", pauseCamera);
+    };
+  }, [mapInstance]);
+
   const centerOnFix = useCallback((fix: Coordinate) => {
-    if (mapInstance) {
-      mapInstance.easeTo({ center: [fix.lng, fix.lat], zoom: Math.max(mapInstance.getZoom(), 15), duration: 800 });
-    } else {
-      setViewport((current) => ({
-        ...current,
-        center: [fix.lng, fix.lat],
-        zoom: Math.max(current.zoom, 15),
-      }));
-    }
+    if (!mapInstance) return;
+    mapInstance.easeTo({ center: [fix.lng, fix.lat], zoom: Math.max(mapInstance.getZoom(), 15), duration: 800 });
   }, [mapInstance]);
 
   useEffect(() => {
-    if (!liveFix || hasCenteredOnUserRef.current || cameraLocked || pinTarget
-      || manualOrigin || destination) return;
-    hasCenteredOnUserRef.current = true;
-    centerOnFix(liveFix);
-  }, [cameraLocked, centerOnFix, destination, liveFix, manualOrigin, pinTarget]);
+    if (!mapInstance || !mapReady || !liveFix || pinTarget) return;
+
+    if (cameraMode === "follow") {
+      const follow = () => {
+        if (haversineMeters(mapInstance.getCenter(), liveFix) < FOLLOW_THRESHOLD_METERS) return;
+        mapInstance.easeTo({ center: [liveFix.lng, liveFix.lat], duration: 450 });
+      };
+      if (!mapInstance.isMoving()) {
+        follow();
+        return;
+      }
+      // Apply a fix that arrived during a camera animation as soon as it finishes.
+      const handleMoveEnd = ({ originalEvent }: { originalEvent?: Event }) => {
+        if (!originalEvent) follow();
+      };
+      mapInstance.once("moveend", handleMoveEnd);
+      return () => { mapInstance.off("moveend", handleMoveEnd); };
+    }
+
+    if (cameraMode === "overview" && !hasCenteredOnUserRef.current && !manualOrigin && !destination) {
+      hasCenteredOnUserRef.current = true;
+      centerOnFix(liveFix);
+    }
+  }, [cameraMode, centerOnFix, destination, liveFix, manualOrigin, mapInstance, mapReady, pinTarget]);
 
   const handleRetryLocationAccess = () => {
-    if (liveFix) centerOnFix(liveFix);
-    else retryLocation.current();
+    if (!liveFix) {
+      retryLocation.current();
+    } else if (cameraMode === "follow") {
+      setCameraMode("free");
+    } else {
+      setCameraMode("follow");
+      centerOnFix(liveFix);
+    }
   };
 
-  const focusRouteIn3D = (origin: Coordinate | null, target: Coordinate | null) => {
+  const focusRouteIn3D = (origin: Coordinate | null, target: Coordinate | null, follow = false) => {
     if (!origin || !mapInstance) return;
-    setCameraLocked(true);
+    setCameraMode(follow ? "follow" : "free");
     mapInstance.easeTo({
       center: [origin.lng, origin.lat],
       zoom: Math.max(mapInstance.getZoom(), target ? 16 : 15),
@@ -673,9 +797,6 @@ export default function ConvoyMap() {
   const getMemberForLocation = (location: MemberLocation) =>
     members.find((member) => member.user_id === location.user_id);
 
-  const isStale = (updatedAt: string) =>
-    Date.now() - new Date(updatedAt).getTime() > 30000;
-
   const getMemberPinLabel = (member: MemberWithProfile) =>
     member.profiles?.display_name?.trim().charAt(0).toUpperCase() || member.role.charAt(0).toUpperCase();
 
@@ -689,64 +810,49 @@ export default function ConvoyMap() {
   }, [originMode, plannedOrigin]);
 
   useEffect(() => {
-    setRouteOptions([]);
-    setSelectedRouteIndex(0);
-    setRouteError(null);
-    if (!destination || !routeOrigin) {
+    setPreviewedRoute(null);
+    if (!destination || !routeOrigin || showSharedOnly) {
       setIsLoadingRoutes(false);
       return;
     }
 
     const controller = new AbortController();
-    const timeout = window.setTimeout(() => controller.abort("timeout"), 12_000);
-    const fetchRoute = async () => {
-      setIsLoadingRoutes(true);
-      let failureMessage = "Driving directions are unavailable. Showing straight-line distance.";
-      try {
-        const endpoints = `${routeOrigin.lng},${routeOrigin.lat};${destination.lng},${destination.lat}`;
-        const url = `https://router.project-osrm.org/route/v1/driving/${endpoints}?overview=full&geometries=geojson&alternatives=true&radiuses=150;150`;
-        const response = await fetch(url, { signal: controller.signal });
-        const json = await response.json() as {
-          code?: string;
-          waypoints?: { distance: number }[];
-          routes?: { geometry: { coordinates: RouteCoordinate[] }; distance: number; duration: number }[];
-        };
-        if (controller.signal.aborted) return;
-        if (json.code === "NoSegment" || json.code === "NoRoute") {
-          failureMessage = "No driving route connects these pins. Try placing the start or destination near a road entrance.";
+    setIsLoadingRoutes(true);
+    void Promise.all([
+      fetchDrivingRoutes(routeOrigin, destination, controller.signal, true),
+      via ? fetchDrivingRoutes(routeOrigin, destination, controller.signal, false, via) : null,
+    ]).then(([{ routes, message }, viaResult]) => {
+      if (controller.signal.aborted) return;
+      const options = routes.map((route) => ({ route, via: false }));
+      const viaRoute = viaResult?.routes[0];
+      let viaMessage = viaResult?.message ?? null;
+      if (viaRoute) {
+        if (routes.some((route) => sameRoute(route, viaRoute))) {
+          viaMessage = "That pin follows a suggested route. Try a different road.";
+        } else {
+          options.push({ route: viaRoute, via: true });
         }
-        if (!response.ok || json.code !== "Ok" || !json.routes?.length) throw new Error(failureMessage);
-
-        setRouteOptions(json.routes.map((route) => ({
-          coordinates: route.geometry.coordinates,
-          distance: route.distance,
-          duration: route.duration,
-          mode: "routed",
-        })));
-        if (json.waypoints?.some(({ distance }) => distance > 40)) {
-          setRouteError("The driving route starts or ends at a nearby road. Check the pin and use the entrance for a closer match.");
-        }
-      } catch {
-        if (controller.signal.aborted && controller.signal.reason !== "timeout") return;
-        setRouteOptions([{
+      }
+      if (!options.length) {
+        options.push({ route: {
           coordinates: [[routeOrigin.lng, routeOrigin.lat], [destination.lng, destination.lat]],
           distance: haversineMeters(routeOrigin, destination),
           duration: 0,
           mode: "direct",
-        }]);
-        setRouteError(failureMessage);
-      } finally {
-        clearTimeout(timeout);
-        if (!controller.signal.aborted || controller.signal.reason === "timeout") setIsLoadingRoutes(false);
+        }, via: false });
       }
-    };
-
-    void fetchRoute();
-    return () => {
-      clearTimeout(timeout);
-      controller.abort();
-    };
-  }, [destination, routeOrigin]);
+      setRouteSearch({
+        origin: routeOrigin,
+        destination,
+        via,
+        options,
+        message: options[0].route.mode === "direct" ? `${message ?? "Driving directions are unavailable."} Showing straight-line distance.` : routes.length ? message : null,
+        viaMessage,
+      });
+      setIsLoadingRoutes(false);
+    });
+    return () => controller.abort();
+  }, [destination, routeOrigin, showSharedOnly, via]);
 
   const handleSelectOrigin = useCallback((suggestion: DestinationSuggestion) => {
     const { lat, lon, display_name: name } = suggestion;
@@ -754,6 +860,7 @@ export default function ConvoyMap() {
     setOriginMode("manual");
     setOriginInput(name);
     setManualOrigin({ name, lat, lng: lon });
+    setSwitchToLive(false);
     setPlannerError(null);
   }, []);
 
@@ -765,10 +872,11 @@ export default function ConvoyMap() {
     setPlannerError(null);
   }, []);
 
-  const handlePickPin = (target: "from" | "to") => {
+  const handlePickPin = (target: "from" | "to" | "via") => {
+    if (target === "from") setSwitchToLive(false);
     setPinTarget(target);
     setPlannerError(null);
-    setCameraLocked(true);
+    setCameraMode("free");
   };
 
   useEffect(() => {
@@ -780,7 +888,8 @@ export default function ConvoyMap() {
       const lng = ((lngLat.lng + 180) % 360 + 360) % 360 - 180;
       const coordinate = coordinateSuggestion(lngLat.lat, lng);
       if (pinTarget === "from") handleSelectOrigin(coordinate);
-      else handleSelectDestination(coordinate);
+      else if (pinTarget === "to") handleSelectDestination(coordinate);
+      else if (destination) setViaPin({ point: { lat: lngLat.lat, lng }, destination });
       setPinTarget(null);
     };
     mapInstance.on("click", handleClick);
@@ -788,24 +897,42 @@ export default function ConvoyMap() {
       canvas.style.cursor = previousCursor;
       mapInstance.off("click", handleClick);
     };
-  }, [handleSelectDestination, handleSelectOrigin, mapInstance, pinTarget]);
+  }, [destination, handleSelectDestination, handleSelectOrigin, mapInstance, pinTarget]);
 
   const handleOriginInputChange = (value: string) => {
+    setSwitchToLive(false);
+    setCameraMode("free");
     setOriginMode("manual");
     setOriginInput(value);
     setManualOrigin(null);
     setPlannerError(null);
   };
 
-  const handleUseLiveOrigin = () => {
+  const applyLiveOrigin = useCallback((fix: Coordinate) => {
+    setSwitchToLive(false);
     setOriginMode("live");
     setOriginInput(LIVE_ORIGIN_LABEL);
     setManualOrigin(null);
     setPinTarget(null);
     setPlannerError(null);
-    setRouteOrigin(liveFix);
-    if (liveFix) centerOnFix(liveFix);
-    else retryLocation.current();
+    setRouteOrigin(fix);
+    setCameraMode("follow");
+    centerOnFix(fix);
+  }, [centerOnFix]);
+
+  useEffect(() => {
+    if (switchToLive && liveFix) applyLiveOrigin(liveFix);
+  }, [applyLiveOrigin, liveFix, switchToLive]);
+
+  const handleUseLiveOrigin = () => {
+    if (liveFix) {
+      applyLiveOrigin(liveFix);
+      return;
+    }
+    if (!environmentError) {
+      setSwitchToLive(true);
+      retryLocation.current();
+    }
   };
 
   const handleApplyRouteSearch = async () => {
@@ -823,22 +950,25 @@ export default function ConvoyMap() {
       return;
     }
 
-    if (convoy?.leader_id === user?.id && target !== destination) {
+    if (isLeader && target !== destination) {
       setApplyingRoute(true);
       try {
         const { data, error } = await supabase.from("convoys").update({
           destination_address: target.name,
           destination_lat: target.lat,
           destination_lng: target.lng,
-        }).eq("id", id!).select("id").single();
+        }).eq("id", id!).select("*").single();
         if (error || !data) throw error ?? new Error("Destination update was not applied");
+        convoyRequestRef.current += 1;
+        setConvoy(data);
+        setViaPin(null);
+        void loadSharedRoute();
       } catch {
         setPlannerError("The convoy destination could not be saved. Try again.");
         return;
       } finally {
         setApplyingRoute(false);
       }
-      convoyRequestRef.current += 1;
     } else if (target !== destination) {
       localDestinationRef.current = true;
     }
@@ -854,50 +984,112 @@ export default function ConvoyMap() {
     setRouteOrigin(currentOrigin);
     if (!currentOrigin) return;
     if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
-    focusRouteIn3D(currentOrigin, target);
+    focusRouteIn3D(currentOrigin, target, originMode === "live");
     setPlannerMinimized(true);
   };
 
-  const routeBoundsPoints = useMemo<RouteCoordinate[]>(() => {
+  const getRouteBoundsPoints = useCallback((route: RouteOption | null): RouteCoordinate[] => {
+    if (route?.mode === "routed") return route.coordinates;
     if (!destination) return [];
     const endpoints: RouteCoordinate[] = [[destination.lng, destination.lat]];
     if (routeOrigin) endpoints.unshift([routeOrigin.lng, routeOrigin.lat]);
-    return selectedRoute ? [...endpoints, ...selectedRoute.coordinates] : endpoints;
-  }, [destination, routeOrigin, selectedRoute]);
+    return route ? [...endpoints, ...route.coordinates] : endpoints;
+  }, [destination, routeOrigin]);
 
-  useEffect(() => {
-    if (!mapInstance || !mapReady || cameraLocked || pinTarget || routeBoundsPoints.length === 0) return;
+  const showRouteOverview = useCallback((points: RouteCoordinate[]) => {
+    if (!mapInstance || points.length === 0) return;
 
-    if (routeBoundsPoints.length === 1) {
+    if (points.length === 1) {
       mapInstance.easeTo({
-        center: routeBoundsPoints[0],
+        center: points[0],
         zoom: 14,
+        bearing: 0,
+        pitch: 0,
         duration: 700,
       });
       return;
     }
 
-    const bounds = routeBoundsPoints.reduce(
+    const bounds = points.reduce(
       (currentBounds, coordinate) => currentBounds.extend(coordinate),
       new LngLatBounds(),
     );
     mapInstance.fitBounds(bounds, {
       duration: 900,
       maxZoom: 15,
+      bearing: 0,
+      pitch: 0,
       padding: { top: 140, right: 45, bottom: 90, left: 45 },
     });
-  }, [cameraLocked, mapInstance, mapReady, pinTarget, routeBoundsPoints]);
+  }, [mapInstance]);
+
+  useEffect(() => {
+    if (!mapReady || cameraMode !== "overview" || pinTarget || !destination) return;
+    if (initialFrameRef.current === "route" || (routeOrigin && !selectedRoute)) return;
+
+    const frame = selectedRoute ? "route" : "destination";
+    if (initialFrameRef.current === frame) return;
+    initialFrameRef.current = frame;
+    showRouteOverview(getRouteBoundsPoints(selectedRoute));
+  }, [cameraMode, destination, getRouteBoundsPoints, mapReady, pinTarget, routeOrigin, selectedRoute, showRouteOverview]);
+
+  const handleSelectRoute = useCallback((route: RouteOption) => {
+    setCameraMode("free");
+    setPreviewedRoute(route);
+    showRouteOverview(getRouteBoundsPoints(route));
+  }, [getRouteBoundsPoints, showRouteOverview]);
+
+  useEffect(() => {
+    if (!mapInstance || pinTarget || !routeChoices.length) return;
+    const handleClick = ({ point }: { point: { x: number; y: number } }) => {
+      const layers = routeChoices.map(({ id }) => `route-layer-${id}`).filter((layer) => mapInstance.getLayer(layer));
+      if (!layers.length) return;
+      const [feature] = mapInstance.queryRenderedFeatures([point.x, point.y], { layers });
+      const choice = routeChoices.find(({ id }) => `route-layer-${id}` === feature?.layer.id);
+      if (choice) handleSelectRoute(choice.route);
+    };
+    mapInstance.on("click", handleClick);
+    return () => { mapInstance.off("click", handleClick); };
+  }, [handleSelectRoute, mapInstance, pinTarget, routeChoices]);
+
+  const canShareSelectedRoute = isLeader && Boolean(id && user && destination && currentSearch
+    && selectedChoice && selectedRoute?.mode === "routed" && !selectedChoice.shared
+    && !isLoadingRoutes && convoy?.destination_lat === destination.lat && convoy?.destination_lng === destination.lng);
+
+  const handleShareRoute = async () => {
+    if (!canShareSelectedRoute || !id || !user || !destination || !selectedRoute || sharingRoute) return;
+    setSharingRoute(true);
+    try {
+      const { coordinates, duration, distance } = selectedRoute;
+      const { error } = await supabase.from("convoy_routes").upsert({
+        convoy_id: id,
+        destination_lat: destination.lat,
+        destination_lng: destination.lng,
+        route: { coordinates, duration, distance },
+        shared_by: user.id,
+      });
+      if (error) throw error;
+      await loadSharedRoute();
+      toast.success("Route shared with the convoy.");
+    } catch (error) {
+      console.warn("Could not share convoy route:", error);
+      const code = error && typeof error === "object" && "code" in error ? error.code : null;
+      toast.error(code === "PGRST205" || code === "42P01"
+        ? "Route sharing isn't set up on this server yet. You can still preview routes."
+        : "Couldn't share this route. Check the connection and destination, then try again.");
+    } finally {
+      setSharingRoute(false);
+    }
+  };
 
   const visibleDestination = selectedDestination ?? destination;
-  const handle3DView = () => focusRouteIn3D(plannedOrigin, visibleDestination);
+  const handle3DView = () => focusRouteIn3D(plannedOrigin, visibleDestination, originMode === "live");
 
   const handleResetView = () => {
-    setCameraLocked(false);
-    mapInstance?.easeTo({
-      pitch: 0,
-      bearing: 0,
-      duration: 700,
-    });
+    setCameraMode("free");
+    const points = getRouteBoundsPoints(selectedRoute);
+    if (points.length) showRouteOverview(points);
+    else mapInstance?.easeTo({ pitch: 0, bearing: 0, duration: 700 });
   };
 
   return (
@@ -964,40 +1156,42 @@ export default function ConvoyMap() {
             : "absolute inset-0"}
           center={DEFAULT_VIEWPORT.center}
           zoom={DEFAULT_VIEWPORT.zoom}
-          viewport={viewport}
           onViewportChange={setViewport}
           maxPitch={60}
         >
           {myLocation && <MapRoute coordinates={gpsOutline} color={liveFix ? "#3b82f6" : "#64748b"} width={2} opacity={0.55} interactive={false} />}
-          {sortedRoutes.map(({ route, index }) => {
-            const isSelected = index === selectedRouteIndex;
+          {[...routeChoices.filter((choice) => choice !== selectedChoice), ...(selectedChoice ? [selectedChoice] : [])].map(({ route, id, color, shared }) => {
+            const isSelected = route === selectedRoute;
             const isDirect = route.mode === "direct";
 
             return (
               <MapRoute
-                key={`route-${index}`}
-                id={`route-${index}`}
+                key={`${id}-${route.mode}-${isSelected}`}
+                id={id}
                 coordinates={route.coordinates}
-                color={isDirect ? (isSelected ? "hsl(var(--accent))" : "#fbbf24") : isSelected ? "#6366f1" : "#94a3b8"}
-                width={isSelected ? 6 : 5}
-                opacity={isSelected ? 1 : 0.6}
+                color={isDirect ? "#fbbf24" : color}
+                width={isSelected ? 7 : shared ? 6 : 4}
+                opacity={isSelected || shared ? 1 : 0.7}
                 dashArray={isDirect ? [2, 2] : undefined}
                 interactive={!pinTarget}
-                onClick={() => {
-                  if (pinTarget) return;
-                  setCameraLocked(false);
-                  setSelectedRouteIndex(index);
-                }}
               />
             );
           })}
+
+          {via && (
+            <MapMarker longitude={via.lng} latitude={via.lat}>
+              <MarkerContent>
+                <ConvoyMarkerPin color="#0ea5e9" label="V" />
+              </MarkerContent>
+            </MapMarker>
+          )}
 
           {mapViewMode === "members" &&
             locations.map((location) => {
               const member = getMemberForLocation(location);
               if (!member || location.user_id === userId) return null;
 
-              const stale = isStale(location.updated_at);
+              const stale = isMemberLocationStale(location.updated_at, locationClock);
               return (
                 <MapMarker
                   key={location.id}
@@ -1006,6 +1200,7 @@ export default function ConvoyMap() {
                   anchor="bottom"
                 >
                   <MarkerContent>
+                    <MemberSpeedLabel speed={location.speed} stale={stale} />
                     <ConvoyMarkerPin
                       color={getMemberColor(member.role)}
                       label={getMemberPinLabel(member)}
@@ -1017,7 +1212,7 @@ export default function ConvoyMap() {
                       <p className="font-semibold">{member.profiles?.display_name || "Unknown"}</p>
                       <p className="text-xs capitalize text-muted-foreground">Role: {member.role}</p>
                       <p className="text-xs text-muted-foreground">
-                        Speed: {(location.speed ?? 0).toFixed(1)} km/h
+                        Speed: {formatLiveSpeed(location.speed, stale)}
                       </p>
                       <p className="text-xs text-muted-foreground">
                         Updated: {new Date(location.updated_at).toLocaleTimeString()}
@@ -1034,6 +1229,7 @@ export default function ConvoyMap() {
           {mapViewMode === "members" && myLocation && (
             <MapMarker longitude={myLocation.lng} latitude={myLocation.lat} anchor="center">
               <MarkerContent>
+                <MemberSpeedLabel speed={liveFix?.speed ?? null} stale={stale} />
                 <CurrentLocationMarker heading={myLocation.heading} precise={Boolean(liveFix)} />
               </MarkerContent>
               <MarkerPopup className="min-w-[170px]">
@@ -1046,7 +1242,7 @@ export default function ConvoyMap() {
                     Accuracy: ±{Math.round(myLocation.accuracy)} m
                   </p>
                   <p className="text-xs text-muted-foreground">
-                    Speed: {liveFix ? `${myLocation.speed.toFixed(1)} km/h` : "Unavailable"}
+                    Speed: {formatLiveSpeed(liveFix?.speed ?? null, stale)}
                   </p>
                   <p className="text-xs text-muted-foreground capitalize">
                     Fix time: {new Date(myLocation.timestamp).toLocaleTimeString()}
@@ -1063,28 +1259,24 @@ export default function ConvoyMap() {
               clusterMaxZoom={14}
               clusterColors={["#1d8cf8", "#6d5dfc", "#e23670"]}
               pointColor="#1d8cf8"
-              onPointClick={(feature, coordinates) => {
-                setSelectedSpeedPoint({
-                  coordinates,
-                  properties: feature.properties as SpeedPointProperties,
-                });
-              }}
+              pointLabelProperty="speedLabel"
+              onPointClick={(feature) => setSelectedSpeedUserId(feature.properties.userId)}
             />
           )}
 
           {mapViewMode === "speed" && selectedSpeedPoint && (
             <MapPopup
-              key={`${selectedSpeedPoint.coordinates[0]}-${selectedSpeedPoint.coordinates[1]}`}
-              longitude={selectedSpeedPoint.coordinates[0]}
-              latitude={selectedSpeedPoint.coordinates[1]}
-              onClose={() => setSelectedSpeedPoint(null)}
+              key={selectedSpeedPoint.properties.userId}
+              longitude={selectedSpeedPoint.geometry.coordinates[0]}
+              latitude={selectedSpeedPoint.geometry.coordinates[1]}
+              onClose={() => setSelectedSpeedUserId(null)}
               closeOnClick={false}
               focusAfterOpen={false}
               closeButton
             >
               <div className="space-y-1 p-1">
                 <p className="text-sm font-semibold">{selectedSpeedPoint.properties.name}</p>
-                <p className="text-sm">Speed: {selectedSpeedPoint.properties.speed.toFixed(1)} km/h</p>
+                <p className="text-sm">Speed: {selectedSpeedPoint.properties.speedLabel}</p>
                 <p className="text-xs capitalize text-muted-foreground">
                   Role: {selectedSpeedPoint.properties.role}
                 </p>
@@ -1161,11 +1353,11 @@ export default function ConvoyMap() {
 
         {!pinTarget && <ViewportHud viewport={viewport} />}
 
-        <div hidden={Boolean(pinTarget)} className="absolute left-3 top-20 z-20 flex flex-col gap-2 [&[hidden]]:hidden">
+        <div hidden={Boolean(pinTarget)} className="absolute left-3 top-20 z-20 flex max-h-[calc(100%-10rem)] max-w-[calc(100%-1.5rem)] flex-col items-start gap-2 overflow-y-auto [&[hidden]]:hidden">
           <div className="w-[min(360px,calc(100vw-1.5rem))] rounded-2xl border bg-card/95 p-3 shadow-lg backdrop-blur-md">
             <div className="flex items-start justify-between gap-3">
               <div className="min-w-0">
-                <p className="text-sm font-semibold">{locationStatusMessage}</p>
+                <p role="status" className="text-sm font-semibold">{locationStatusMessage}</p>
                 {locationError && (
                   <p className="mt-1 text-xs text-destructive">{locationError}</p>
                 )}
@@ -1176,12 +1368,8 @@ export default function ConvoyMap() {
                   <p className="mt-1 text-xs text-muted-foreground">{locationHint}</p>
                 )}
                 <div className="mt-2 flex flex-wrap gap-2 text-[11px] text-muted-foreground">
-                  <span className="rounded-full border px-2 py-1">
-                    Retries: {retryCount}
-                  </span>
-                  <span className="rounded-full border px-2 py-1">
-                    {locationSourceLabel}
-                  </span>
+                  {retryCount > 0 && <span className="rounded-full border px-2 py-1">Retries: {retryCount}</span>}
+                  {locationSourceLabel && <span className="rounded-full border px-2 py-1">{locationSourceLabel}</span>}
                   <span className="rounded-full border px-2 py-1">
                     Permission: {locationPermissionState}
                   </span>
@@ -1195,16 +1383,26 @@ export default function ConvoyMap() {
                 size="sm"
                 variant="secondary"
                 onClick={handleRetryLocationAccess}
-                disabled={Boolean(environmentError)}
+                disabled={Boolean(environmentError) || locationPhase === "requesting"}
+                aria-pressed={liveFix ? cameraMode === "follow" : undefined}
                 className="gap-2"
               >
                 <LocateFixed className="h-4 w-4" />
-                {liveFix ? "Center on my location" : "Retry location"}
+                {liveFix ? cameraMode === "follow" ? "Stop following" : "Follow my location"
+                  : needsPermission ? "Enable location" : "Retry location"}
               </Button>
+              {!liveFix && originMode === "live" && (
+                <Button size="sm" variant="outline" onClick={() => {
+                  setPlannerMinimized(false);
+                  handleOriginInputChange("");
+                }}>
+                  Choose starting point
+                </Button>
+              )}
             </div>
           </div>
 
-          <div className="flex flex-col gap-2 sm:flex-row">
+          <div className="flex flex-wrap gap-2">
             <Button size="sm" variant="secondary" onClick={handle3DView}>
               <Mountain className="mr-1.5 h-4 w-4" />
               3D View
@@ -1215,54 +1413,63 @@ export default function ConvoyMap() {
             </Button>
           </div>
 
-          {routeOptions.length > 0 && (
-            <div className="flex max-w-[min(320px,calc(100vw-1.5rem))] flex-col gap-2">
-              {routeOptions.map((route, index) => {
-                const isActive = index === selectedRouteIndex;
-                const isFastest = index === 0 && route.mode === "routed";
-
-                return (
-                  <Button
-                    key={`route-option-${index}`}
-                    variant={isActive ? "default" : "secondary"}
-                    size="sm"
-                    onClick={() => {
-                      setCameraLocked(false);
-                      setSelectedRouteIndex(index);
-                    }}
-                    className="justify-start gap-3 px-3 py-5"
-                  >
-                    {route.mode === "routed" && (
-                      <div className="flex items-center gap-1.5">
-                        <Clock className="h-3.5 w-3.5" />
-                        <span className="font-medium">{formatDuration(route.duration)}</span>
-                      </div>
-                    )}
-                    <div className="flex items-center gap-1.5 text-xs opacity-80">
-                      <RouteIcon className="h-3 w-3" />
-                      {formatDistance(route.distance)}
+          {(routeChoices.length > 0 || isLoadingRoutes) && (
+            <section className="w-[min(330px,calc(100vw-1.5rem))] rounded-2xl border bg-card/95 p-3 shadow-lg backdrop-blur-md" aria-label="Route options">
+              <button type="button" aria-expanded={showRouteChoices} onClick={() => setShowRouteChoices(!showRouteChoices)}
+                className="flex w-full items-center justify-between gap-2 text-left text-sm font-semibold">
+                <span className="flex items-center gap-2"><RouteIcon className="size-4 text-primary" />
+                  {showSharedOnly ? "Leader's route" : "Route options"}
+                </span>
+                {showRouteChoices ? <ChevronUp className="size-4" /> : <ChevronDown className="size-4" />}
+              </button>
+              {showRouteChoices && (
+                <div className="mt-2 space-y-2">
+                  {isLoadingRoutes && <p role="status" className="text-xs text-muted-foreground">Finding driving routes...</p>}
+                  {!isLoadingRoutes && !showSharedOnly && currentSearch?.options.length === 1 && currentSearch.options[0].route.mode === "routed" && !via && (
+                    <p className="text-xs text-muted-foreground">The router found one driving route for these points.</p>
+                  )}
+                  <div className="space-y-1.5">
+                    {routeChoices.map(({ id, route, label, fastest, color }) => (
+                      <Button type="button" key={id} variant={route === selectedRoute ? "secondary" : "outline"} size="sm"
+                        aria-pressed={route === selectedRoute} onClick={() => handleSelectRoute(route)}
+                        className="h-auto min-h-10 w-full flex-wrap justify-start gap-x-2 gap-y-1 px-2.5 py-2 text-xs">
+                        <span aria-hidden="true" className="size-2.5 shrink-0 rounded-full" style={{ backgroundColor: route.mode === "direct" ? "#fbbf24" : color }} />
+                        <span className="mr-auto font-semibold">{label}</span>
+                        {route.mode === "routed" && <span className="flex items-center gap-1"><Clock className="size-3" />{formatDuration(route.duration)}</span>}
+                        <span className="text-muted-foreground">{formatDistance(route.distance)}</span>
+                        {fastest && <Badge variant="secondary" className="px-1.5 py-0 text-[10px]">Fastest</Badge>}
+                      </Button>
+                    ))}
+                  </div>
+                  {!isLeader && !sharedRoute && <p className="text-xs text-muted-foreground">Preview only. The leader chooses the shared route.</p>}
+                  {isLeader && (
+                    <div className="space-y-2">
+                      {currentSearch?.viaMessage && <p role="status" className="text-xs text-muted-foreground">{currentSearch.viaMessage}</p>}
+                      {routeOrigin && destination && (
+                        <div className="flex flex-wrap gap-2">
+                          <Button type="button" variant="ghost" size="sm" onClick={() => handlePickPin("via")}>
+                            <MapPin className="mr-1 size-3.5" />{via ? "Move via pin" : "Try another road"}
+                          </Button>
+                          {via && <Button type="button" variant="ghost" size="sm" onClick={() => setViaPin(null)}>Remove via pin</Button>}
+                        </div>
+                      )}
+                      {canShareSelectedRoute && (
+                        <Button type="button" size="sm" className="w-full" disabled={sharingRoute} onClick={() => void handleShareRoute()}>
+                          {sharingRoute ? "Sharing..." : "Share with convoy"}
+                        </Button>
+                      )}
                     </div>
-                    {isFastest && (
-                      <span className="rounded bg-green-100 px-1.5 py-0.5 text-[10px] font-medium text-green-700 dark:bg-green-900 dark:text-green-300">
-                        Fastest
-                      </span>
-                    )}
-                    {route.mode === "direct" && (
-                      <span className="rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 dark:bg-amber-900 dark:text-amber-300">
-                        Direct
-                      </span>
-                    )}
-                  </Button>
-                );
-              })}
-            </div>
+                  )}
+                </div>
+              )}
+            </section>
           )}
         </div>
 
         <div className="absolute top-3 left-1/2 z-30 w-[min(680px,92vw)] -translate-x-1/2">
           {pinTarget ? (
             <div className="flex items-center justify-between gap-3 rounded-xl border bg-card/95 px-4 py-3 shadow-lg" role="status">
-              <p className="text-sm font-semibold">Tap the map to place the {pinTarget === "from" ? "starting point" : "destination"}.</p>
+              <p className="text-sm font-semibold">{pinTarget === "via" ? "Tap a road the convoy should pass through." : `Tap the map to place the ${pinTarget === "from" ? "starting point" : "destination"}.`}</p>
               <Button type="button" size="sm" variant="outline" onClick={() => setPinTarget(null)}>Cancel</Button>
             </div>
           ) : plannerMinimized ? (
@@ -1359,7 +1566,7 @@ export default function ConvoyMap() {
                     size="sm"
                     variant={originMode === "live" ? "secondary" : "outline"}
                     onClick={handleUseLiveOrigin}
-                    disabled={applyingRoute}
+                    disabled={applyingRoute || Boolean(environmentError) || locationPhase === "requesting"}
                     className="gap-2"
                   >
                     <LocateFixed className="h-4 w-4" />
@@ -1379,7 +1586,7 @@ export default function ConvoyMap() {
 
               <div className="flex flex-wrap gap-2 text-xs text-muted-foreground">
                 <Badge variant={originMode === "live" ? "secondary" : "outline"} className="text-[10px]">
-                  {originMode === "live" ? liveFix ? "Live start" : "Waiting for GPS" : "Custom start"}
+                  {originMode === "live" ? liveFix ? "Live start" : "Start needed" : "Custom start"}
                 </Badge>
                 <span>
                   {originMode === "live"
@@ -1492,9 +1699,6 @@ export default function ConvoyMap() {
 
               {(plannerError || routeError) && <p role="status" className="text-xs text-amber-700">{plannerError ?? routeError}</p>}
 
-              {locationError && (
-                <p className="text-xs text-destructive">{locationError}</p>
-              )}
             </form>
           )}
         </div>
@@ -1519,7 +1723,7 @@ export default function ConvoyMap() {
                 const member = getMemberForLocation(location);
                 if (!member) return null;
 
-                const stale = isStale(location.updated_at);
+                const stale = isMemberLocationStale(location.updated_at, locationClock);
                 return (
                   <div key={location.id} className="flex items-center gap-3 rounded-lg bg-muted/50 p-2">
                     <div

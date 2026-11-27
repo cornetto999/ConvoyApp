@@ -178,7 +178,7 @@ export default function Auth() {
         locationRequestError.code === GEOLOCATION_TIMEOUT
       ) {
         markLocationPromptSeen();
-        toast.message("Location access is on. Convoy will keep trying while your GPS gets a fix.");
+        toast.message("Location is still unavailable. You can try again from the convoy map.");
         navigateToApp();
         return;
       }

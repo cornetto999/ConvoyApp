@@ -10,6 +10,7 @@ import {
   type GeolocationPermissionState,
 } from "@/lib/geolocation";
 import {
+  isRoutingFix,
   POSITION_MAX_AGE_MS,
   selectConvoyFix,
   type ConvoyFix,
@@ -17,6 +18,14 @@ import {
 
 // Allow time for a slow lock before restarting a silent watch.
 const WATCH_SILENCE_MS = (WATCH_POSITION_OPTIONS.timeout ?? 10_000) + 2000;
+const DEVICE_LOCATION_OPTIONS: PositionOptions = {
+  enableHighAccuracy: false,
+  maximumAge: 0,
+  timeout: 20_000,
+};
+const DEVICE_REQUEST_LIMIT_MS = 30_000;
+
+type LocationPhase = "idle" | "requesting" | "locating" | "tracking" | "retrying" | "unavailable";
 
 export function useConvoyPosition(enabled: boolean) {
   const [fix, setFix] = useState<ConvoyFix | null>(null);
@@ -25,6 +34,7 @@ export function useConvoyPosition(enabled: boolean) {
   const [permission, setPermission] = useState<GeolocationPermissionState>("unknown");
   const [error, setError] = useState<number | null>(null);
   const [environmentError, setEnvironmentError] = useState<string | null>(null);
+  const [phase, setPhase] = useState<LocationPhase>("idle");
   const retryRef = useRef<() => void>(() => {});
 
   useEffect(() => {
@@ -38,6 +48,15 @@ export function useConvoyPosition(enabled: boolean) {
       setEnvironmentError(getGeolocationUnsupportedMessage());
       return;
     }
+    const documentPolicy = document as Document & {
+      permissionsPolicy?: { allowsFeature: (feature: string) => boolean };
+      featurePolicy?: { allowsFeature: (feature: string) => boolean };
+    };
+    const policy = documentPolicy.permissionsPolicy ?? documentPolicy.featurePolicy;
+    if (policy?.allowsFeature("geolocation") === false) {
+      setEnvironmentError("Location is blocked in this view. Open Convoy directly in your browser.");
+      return;
+    }
 
     const geolocation = navigator.geolocation;
     let currentFix: ConvoyFix | null = null;
@@ -45,14 +64,18 @@ export function useConvoyPosition(enabled: boolean) {
     let revision = 0;
     let retries = 0;
     let disposed = false;
-    let denied = false;
+    let permissionState: GeolocationPermissionState = "unknown";
+    let requestActive = false;
     let restartTimer: ReturnType<typeof setTimeout> | undefined;
     let silenceTimer: ReturnType<typeof setTimeout> | undefined;
     let expiryTimer: ReturnType<typeof setTimeout> | undefined;
+    let requestTimer: ReturnType<typeof setTimeout> | undefined;
     let permissionStatus: PermissionStatus | undefined;
 
-    function stopWatch() {
+    function stopAcquisition() {
       revision += 1;
+      requestActive = false;
+      clearTimeout(requestTimer);
       clearTimeout(restartTimer);
       restartTimer = undefined;
       clearTimeout(silenceTimer);
@@ -60,20 +83,31 @@ export function useConvoyPosition(enabled: boolean) {
       watchId = null;
     }
 
-    function handleDenial() {
-      denied = true;
-      stopWatch();
+    function clearFix() {
       clearTimeout(expiryTimer);
       currentFix = null;
       setFix(null);
       setStale(false);
+    }
+
+    function handleDenial() {
+      permissionState = "denied";
+      stopAcquisition();
+      clearFix();
       setPermission("denied");
       setError(GEOLOCATION_PERMISSION_DENIED);
+      setPhase("idle");
     }
 
     function scheduleRetry(code: number) {
       setError(code);
-      if (restartTimer || retries >= GEOLOCATION_MAX_RETRIES || document.hidden) return;
+      if (restartTimer || document.hidden) return;
+      if (retries >= GEOLOCATION_MAX_RETRIES) {
+        // Leave the browser watch open in case it recovers without another request.
+        setPhase("unavailable");
+        return;
+      }
+      setPhase("retrying");
       restartTimer = setTimeout(() => {
         retries += 1;
         setAttempt(retries);
@@ -82,34 +116,40 @@ export function useConvoyPosition(enabled: boolean) {
       }, GEOLOCATION_RETRY_DELAY_MS);
     }
 
+    function acceptPosition(position: GeolocationPosition) {
+      const next = selectConvoyFix(currentFix, position);
+      if (!next || next === currentFix) return;
+
+      clearTimeout(silenceTimer);
+      clearTimeout(restartTimer);
+      restartTimer = undefined;
+      clearTimeout(expiryTimer);
+      retries = 0;
+      currentFix = next;
+      permissionState = "granted";
+      setFix(next);
+      setStale(false);
+      setPermission("granted");
+      setAttempt(0);
+      setError(null);
+      setPhase(isRoutingFix(next) ? "tracking" : "locating");
+      expiryTimer = setTimeout(() => {
+        setStale(true);
+        if (watchId !== null) scheduleRetry(GEOLOCATION_TIMEOUT);
+      }, POSITION_MAX_AGE_MS - (Date.now() - next.timestamp));
+      if (import.meta.env.DEV) console.debug("Convoy GPS fix", { accuracy: next.accuracy });
+    }
+
     function startWatch() {
-      stopWatch();
-      if (denied || document.hidden) return;
+      stopAcquisition();
+      if (permissionState !== "granted" || document.hidden) return;
+      setPhase(retries > 0 ? "retrying" : isRoutingFix(currentFix) ? "tracking" : "locating");
       const activeRevision = revision;
       silenceTimer = setTimeout(() => scheduleRetry(GEOLOCATION_TIMEOUT), WATCH_SILENCE_MS);
       watchId = geolocation.watchPosition(
         (position) => {
           if (activeRevision !== revision) return;
-          const next = selectConvoyFix(currentFix, position);
-          if (!next || next === currentFix) return;
-
-          clearTimeout(silenceTimer);
-          clearTimeout(restartTimer);
-          restartTimer = undefined;
-          clearTimeout(expiryTimer);
-          retries = 0;
-          currentFix = next;
-          setFix(next);
-          setStale(false);
-          setPermission("granted");
-          setAttempt(0);
-          setError(null);
-          expiryTimer = setTimeout(() => {
-            setStale(true);
-            // Keep the original fix visible as last known while recovering.
-            scheduleRetry(GEOLOCATION_TIMEOUT);
-          }, POSITION_MAX_AGE_MS - (Date.now() - next.timestamp));
-          if (import.meta.env.DEV) console.debug("Convoy GPS fix", { accuracy: next.accuracy });
+          acceptPosition(position);
         },
         (failure) => {
           if (activeRevision !== revision) return;
@@ -124,16 +164,58 @@ export function useConvoyPosition(enabled: boolean) {
       );
     }
 
-    function restart() {
+    function requestDeviceLocation() {
+      if (requestActive) return;
+      stopAcquisition();
       retries = 0;
       setAttempt(0);
       setError(null);
-      startWatch();
+      setPhase("requesting");
+      requestActive = true;
+      const activeRevision = revision;
+
+      function handleFailure(code: number, fromBrowser = false) {
+        if (activeRevision !== revision) return;
+        if (code === GEOLOCATION_PERMISSION_DENIED) {
+          handleDenial();
+        } else if (!document.hidden && (permissionState === "granted"
+          || (fromBrowser && permissionState === "unknown"))) {
+          // A provider error also means permission was resolved on browsers
+          // that do not expose its state.
+          permissionState = "granted";
+          setPermission("granted");
+          startWatch();
+        } else {
+          stopAcquisition();
+          setError(code);
+          setPhase("unavailable");
+        }
+      }
+
+      // Permission dialogs and embedded browsers can leave a request pending
+      // without starting the browser's own position timeout.
+      requestTimer = setTimeout(() => handleFailure(GEOLOCATION_TIMEOUT), DEVICE_REQUEST_LIMIT_MS);
+      geolocation.getCurrentPosition((position) => {
+        if (activeRevision !== revision) return;
+        permissionState = "granted";
+        setPermission("granted");
+        acceptPosition(position);
+        startWatch();
+      }, (failure) => {
+        handleFailure(failure.code || GEOLOCATION_POSITION_UNAVAILABLE, true);
+      }, DEVICE_LOCATION_OPTIONS);
     }
 
     function handleVisibility() {
-      if (document.hidden) stopWatch();
-      else if (!denied) restart();
+      if (document.hidden) {
+        // A permission dialog can temporarily take focus away from the page.
+        if (!requestActive) stopAcquisition();
+      } else if (!requestActive && permissionState === "granted" && watchId === null) {
+        retries = 0;
+        setAttempt(0);
+        setError(null);
+        startWatch();
+      }
     }
 
     function updatePermission() {
@@ -142,33 +224,36 @@ export function useConvoyPosition(enabled: boolean) {
       if (state === "denied") {
         handleDenial();
       } else {
+        permissionState = state;
         setPermission(state);
-        if (denied) {
-          denied = false;
-          restart();
+        if (state === "granted" && !requestActive && watchId === null) {
+          retries = 0;
+          setAttempt(0);
+          setError(null);
+          startWatch();
+        } else if (state === "prompt" && !requestActive) {
+          if (watchId !== null) stopAcquisition();
+          clearFix();
+          setError(null);
+          setPhase("idle");
         }
       }
     }
 
-    retryRef.current = () => {
-      denied = false;
-      restart();
-    };
+    retryRef.current = requestDeviceLocation;
     document.addEventListener("visibilitychange", handleVisibility);
-    startWatch();
-    // Keep the browser's permission prompt inside the original request path.
-    void navigator.permissions?.query({ name: "geolocation" }).then((status) => {
+    void navigator.permissions?.query?.({ name: "geolocation" }).then((status) => {
       if (disposed) return;
       permissionStatus = status;
       status.addEventListener("change", updatePermission);
       updatePermission();
     }).catch(() => {
-      // Some Safari versions only report permission from watch callbacks.
+      // Browsers without a permission status can still request it from the button.
     });
 
     return () => {
       disposed = true;
-      stopWatch();
+      stopAcquisition();
       clearTimeout(expiryTimer);
       permissionStatus?.removeEventListener("change", updatePermission);
       document.removeEventListener("visibilitychange", handleVisibility);
@@ -176,5 +261,5 @@ export function useConvoyPosition(enabled: boolean) {
     };
   }, [enabled]);
 
-  return { fix, stale, attempt, permission, error, environmentError, retry: retryRef };
+  return { fix, stale, attempt, permission, error, environmentError, phase, retry: retryRef };
 }
